@@ -176,7 +176,7 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
     }
     WritableMap map = Arguments.createMap();
     map.putDouble("currentTime", this.mediaPlayer.getCurrentPosition() / 1000.0);
-    map.putDouble("duration", this.mediaPlayer.getDuration() / 1000.0);
+    map.putDouble("duration", 100);
     promise.resolve(map);
   }
 
@@ -335,6 +335,16 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
                 WritableMap params = Arguments.createMap();
                 params.putBoolean("success", true);
                 sendEvent(getReactApplicationContext(), EVENT_FINISHED_PLAYING, params);
+              }
+            }
+    );
+
+    mediaPlayer.setOnErrorListener(
+            new OnErrorListener() {
+              @Override
+              public boolean onError(MediaPlayer mp, int what, int extra) {
+                Log.d("StreamingMediaDataSource", "onError: " + what + ", extra: " + extra);
+                return false;
               }
             }
     );
