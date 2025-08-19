@@ -6,6 +6,11 @@ import android.media.MediaPlayer;
 import android.media.MediaPlayer.OnCompletionListener;
 import android.media.MediaPlayer.OnPreparedListener;
 import android.net.Uri;
+import android.media.MediaDataSource;
+import java.net.URL;
+import java.net.HttpURLConnection;
+import java.io.InputStream;
+import java.io.ByteArrayOutputStream;
 
 import java.io.File;
 
@@ -31,6 +36,7 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
   public final static String EVENT_FINISHED_LOADING = "FinishedLoading";
   public final static String EVENT_FINISHED_LOADING_FILE = "FinishedLoadingFile";
   public final static String EVENT_FINISHED_LOADING_URL = "FinishedLoadingURL";
+  public final static String EVENT_CHUNK_RECEIVED = "OnChunkReceived";
 
   private final ReactApplicationContext reactContext;
   private MediaPlayer mediaPlayer;
@@ -94,6 +100,17 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
   @ReactMethod
   public void loadUrl(String url) throws IOException {
     prepareUrl(url);
+  }
+
+  @ReactMethod
+  public void playUrlWithStreaming(String url) throws IOException {
+    prepareUrlWithStreaming(url);
+    this.resume();
+  }
+
+  @ReactMethod
+  public void loadUrlWithStreaming(String url) throws IOException {
+    prepareUrlWithStreaming(url);
   }
 
   @ReactMethod
@@ -251,6 +268,37 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
     }
   }
 
+  private void prepareUrlWithStreaming(final String url) throws IOException {
+    try {
+      if (this.mediaPlayer == null) {
+        this.mediaPlayer = initializeMediaPlayerForStreaming(url);
+        this.mediaPlayer.setOnPreparedListener(
+                new OnPreparedListener() {
+                  @Override
+                  public void onPrepared(MediaPlayer mediaPlayer) {
+                    WritableMap onFinishedLoadingURLParams = Arguments.createMap();
+                    onFinishedLoadingURLParams.putBoolean("success", true);
+                    onFinishedLoadingURLParams.putString("url", url);
+                    sendEvent(getReactApplicationContext(), EVENT_FINISHED_LOADING_URL, onFinishedLoadingURLParams);
+                  }
+                }
+        );
+      } else {
+        this.mediaPlayer.reset();
+        StreamingMediaDataSource dataSource = new StreamingMediaDataSource(url);
+        this.mediaPlayer.setDataSource(dataSource);
+        this.mediaPlayer.prepareAsync();
+      }
+      WritableMap params = Arguments.createMap();
+      params.putBoolean("success", true);
+      sendEvent(getReactApplicationContext(), EVENT_FINISHED_LOADING, params);
+    } catch (IOException e) {
+      WritableMap errorParams = Arguments.createMap();
+      errorParams.putString("error", e.getMessage());
+      sendEvent(getReactApplicationContext(), EVENT_SETUP_ERROR, errorParams);
+    }
+  }
+
   private MediaPlayer initializeMediaPlayer(Uri uri) throws IOException {
     MediaPlayer mediaPlayer = MediaPlayer.create(getCurrentActivity(), uri);
 
@@ -272,6 +320,29 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
     return mediaPlayer;
   }
 
+  private MediaPlayer initializeMediaPlayerForStreaming(String url) throws IOException {
+    MediaPlayer mediaPlayer = new MediaPlayer();
+    
+    // Use custom data source for chunk processing
+    StreamingMediaDataSource dataSource = new StreamingMediaDataSource(url);
+    mediaPlayer.setDataSource(dataSource);
+    
+    mediaPlayer.setOnCompletionListener(
+            new OnCompletionListener() {
+              @Override
+              public void onCompletion(MediaPlayer arg0) {
+                WritableMap params = Arguments.createMap();
+                params.putBoolean("success", true);
+                sendEvent(getReactApplicationContext(), EVENT_FINISHED_PLAYING, params);
+              }
+            }
+    );
+    
+    mediaPlayer.prepareAsync(); // Use async prepare for streaming
+    
+    return mediaPlayer;
+  }
+
   private void sendMountFileSuccessEvents(String name, String type) {
     WritableMap params = Arguments.createMap();
     params.putBoolean("success", true);
@@ -289,5 +360,91 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
     WritableMap errorParams = Arguments.createMap();
     errorParams.putString("error", e.getMessage());
     sendEvent(reactContext, EVENT_SETUP_ERROR, errorParams);
+  }
+
+  // Custom MediaDataSource for chunk processing
+  private class StreamingMediaDataSource extends MediaDataSource {
+    private final String url;
+    private HttpURLConnection connection;
+    private long size = -1;
+    private byte[] cachedData;
+    
+    public StreamingMediaDataSource(String url) {
+      this.url = url;
+    }
+    
+    @Override
+    public int readAt(long position, byte[] buffer, int offset, int size) throws IOException {
+      // Initialize connection if needed
+      if (connection == null) {
+        connection = createConnection();
+      }
+      
+      // Handle range request for seeking
+      if (position != 0) {
+        connection.disconnect();
+        connection = createConnection();
+        connection.setRequestProperty("Range", "bytes=" + position + "-");
+        connection.connect();
+      }
+      
+      InputStream inputStream = connection.getInputStream();
+      
+      // Process chunks here - you can add your custom logic
+      byte[] chunk = new byte[size];
+      int bytesRead = inputStream.read(chunk, 0, size);
+      
+      if (bytesRead > 0) {
+        // Here you can process the chunk before returning it
+        processChunk(chunk, bytesRead, position);
+        System.arraycopy(chunk, 0, buffer, offset, bytesRead);
+      }
+      
+      return bytesRead;
+    }
+    
+    @Override
+    public long getSize() throws IOException {
+      if (size == -1) {
+        HttpURLConnection sizeConnection = createConnection();
+        sizeConnection.setRequestMethod("HEAD");
+        sizeConnection.connect();
+        size = sizeConnection.getContentLength();
+        sizeConnection.disconnect();
+      }
+      return size;
+    }
+    
+    @Override
+    public void close() throws IOException {
+      if (connection != null) {
+        connection.disconnect();
+        connection = null;
+      }
+    }
+    
+    private HttpURLConnection createConnection() throws IOException {
+      URL urlObj = new URL(url);
+      HttpURLConnection conn = (HttpURLConnection) urlObj.openConnection();
+      conn.setRequestMethod("GET");
+      conn.setConnectTimeout(10000);
+      conn.setReadTimeout(10000);
+      return conn;
+    }
+    
+    private void processChunk(byte[] chunk, int length, long position) {
+      // Your custom chunk processing logic here
+      // For example, you could:
+      // - Decrypt the chunk
+      // - Apply audio effects
+      // - Log streaming progress
+      // - Send chunk data to React Native
+      
+      WritableMap chunkData = Arguments.createMap();
+      chunkData.putInt("chunkSize", length);
+      chunkData.putDouble("position", position);
+      chunkData.putString("data", android.util.Base64.encodeToString(chunk, 0, length, android.util.Base64.DEFAULT));
+      sendEvent(getReactApplicationContext(), EVENT_CHUNK_RECEIVED, chunkData);
+    }
   }
 }

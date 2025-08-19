@@ -6,13 +6,17 @@ declare module "react-native-sound-player" {
     | "FinishedLoading"
     | "FinishedPlaying"
     | "FinishedLoadingURL"
-    | "FinishedLoadingFile";
+    | "FinishedLoadingFile"
+    | "OnChunkReceived";
 
   export type SoundPlayerEventData = {
     success?: boolean;
     url?: string;
     name?: string;
     type?: string;
+    chunkSize?: number;
+    position?: number;
+    data?: string;
   };
 
   interface SoundPlayerType {
@@ -21,6 +25,8 @@ declare module "react-native-sound-player" {
     loadSoundFile: (name: string, type: string) => void;
     playUrl: (url: string) => void;
     loadUrl: (url: string) => void;
+    playUrlWithStreaming: (url: string) => void;
+    loadUrlWithStreaming: (url: string) => void;
     playAsset: (asset: number) => void;
     loadAsset: (asset: number) => void;
     /** @deprecated  please use addEventListener*/

@@ -17,6 +17,7 @@ static NSString *const EVENT_FINISHED_LOADING = @"FinishedLoading";
 static NSString *const EVENT_FINISHED_LOADING_FILE = @"FinishedLoadingFile";
 static NSString *const EVENT_FINISHED_LOADING_URL = @"FinishedLoadingURL";
 static NSString *const EVENT_FINISHED_PLAYING = @"FinishedPlaying";
+static NSString *const EVENT_CHUNK_RECEIVED = @"OnChunkReceived";
 
 RCT_EXPORT_MODULE();
 
@@ -40,10 +41,14 @@ RCT_EXPORT_MODULE();
 
 - (void)dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
+    if (self.streamingSession) {
+        [self.streamingSession invalidateAndCancel];
+        self.streamingSession = nil;
+    }
 }
 
 - (NSArray<NSString *> *)supportedEvents {
-    return @[EVENT_FINISHED_PLAYING, EVENT_FINISHED_LOADING, EVENT_FINISHED_LOADING_URL, EVENT_FINISHED_LOADING_FILE, EVENT_SETUP_ERROR];
+    return @[EVENT_FINISHED_PLAYING, EVENT_FINISHED_LOADING, EVENT_FINISHED_LOADING_URL, EVENT_FINISHED_LOADING_FILE, EVENT_SETUP_ERROR, EVENT_CHUNK_RECEIVED];
 }
 
 -(void)startObserving {
@@ -63,6 +68,17 @@ RCT_EXPORT_METHOD(playUrl:(NSString *)url) {
 
 RCT_EXPORT_METHOD(loadUrl:(NSString *)url) {
     [self prepareUrl:url];
+}
+
+RCT_EXPORT_METHOD(playUrlWithStreaming:(NSString *)url) {
+    [self prepareUrlWithStreaming:url];
+    if (self.avPlayer) {
+        [self.avPlayer play];
+    }
+}
+
+RCT_EXPORT_METHOD(loadUrlWithStreaming:(NSString *)url) {
+    [self prepareUrlWithStreaming:url];
 }
 
 RCT_EXPORT_METHOD(playSoundFile:(NSString *)name ofType:(NSString *)type) {
@@ -261,6 +277,117 @@ RCT_REMAP_METHOD(getInfo,
 	if (hasListeners) {
 	    [self sendEventWithName:EVENT_SETUP_ERROR body:@{@"error": [error localizedDescription]}];
 	}
+}
+
+- (void)prepareUrlWithStreaming:(NSString *)url {
+    if (self.player) {
+        self.player = nil;
+    }
+    
+    // Create a custom URL scheme for streaming
+    NSString *streamingUrl = [url stringByReplacingOccurrencesOfString:@"https://" withString:@"streaming://"];
+    streamingUrl = [streamingUrl stringByReplacingOccurrencesOfString:@"http://" withString:@"streaming://"];
+    NSURL *streamingURL = [NSURL URLWithString:streamingUrl];
+    
+    // Create AVURLAsset with custom scheme
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:streamingURL options:nil];
+    
+    // Set up resource loader delegate for custom streaming
+    [asset.resourceLoader setDelegate:self queue:dispatch_get_main_queue()];
+    
+    // Create player item and player
+    AVPlayerItem *playerItem = [AVPlayerItem playerItemWithAsset:asset];
+    self.avPlayer = [[AVPlayer alloc] initWithPlayerItem:playerItem];
+    
+    // Store original URL for actual loading
+    [self.avPlayer.currentItem addObserver:self forKeyPath:@"status" options:0 context:nil];
+    
+    // Initialize streaming session
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
+    self.streamingSession = [NSURLSession sessionWithConfiguration:config];
+    self.streamingData = [[NSMutableData alloc] init];
+}
+
+- (BOOL)resourceLoader:(AVAssetResourceLoader *)resourceLoader shouldWaitForLoadingOfRequestedResource:(AVAssetResourceLoadingRequest *)loadingRequest {
+    // Get the original URL by converting back from custom scheme
+    NSString *originalUrl = [loadingRequest.request.URL.absoluteString stringByReplacingOccurrencesOfString:@"streaming://" withString:@"https://"];
+    if ([originalUrl containsString:@"streaming://"]) {
+        originalUrl = [loadingRequest.request.URL.absoluteString stringByReplacingOccurrencesOfString:@"streaming://" withString:@"http://"];
+    }
+    NSURL *url = [NSURL URLWithString:originalUrl];
+    
+    // Create request for the original URL
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    
+    // Handle range requests for seeking
+    if (loadingRequest.dataRequest.requestedOffset > 0) {
+        NSString *rangeHeader = [NSString stringWithFormat:@"bytes=%lld-", loadingRequest.dataRequest.requestedOffset];
+        [request setValue:rangeHeader forHTTPHeaderField:@"Range"];
+    }
+    
+    // Create data task with chunk processing
+    NSURLSessionDataTask *task = [self.streamingSession dataTaskWithRequest:request
+        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            if (error) {
+                [loadingRequest finishLoadingWithError:error];
+                return;
+            }
+            
+            // Process the complete response
+            [self processStreamingResponse:response data:data loadingRequest:loadingRequest];
+        }];
+    
+    [task resume];
+    return YES;
+}
+
+- (void)processStreamingResponse:(NSURLResponse *)response data:(NSData *)data loadingRequest:(AVAssetResourceLoadingRequest *)loadingRequest {
+    // Fill content information
+    if (loadingRequest.contentInformationRequest) {
+        loadingRequest.contentInformationRequest.contentLength = response.expectedContentLength;
+        loadingRequest.contentInformationRequest.contentType = response.MIMEType;
+        loadingRequest.contentInformationRequest.byteRangeAccessSupported = YES;
+    }
+    
+    // Process data in chunks
+    NSUInteger chunkSize = 8192; // 8KB chunks
+    NSUInteger offset = 0;
+    
+    while (offset < data.length) {
+        NSUInteger remainingBytes = data.length - offset;
+        NSUInteger currentChunkSize = MIN(chunkSize, remainingBytes);
+        
+        NSData *chunk = [data subdataWithRange:NSMakeRange(offset, currentChunkSize)];
+        
+        // Process the chunk (your custom logic here)
+        [self processChunk:chunk atPosition:loadingRequest.dataRequest.requestedOffset + offset];
+        
+        // Respond to the loading request with this chunk
+        [loadingRequest.dataRequest respondWithData:chunk];
+        
+        offset += currentChunkSize;
+    }
+    
+    [loadingRequest finishLoading];
+}
+
+- (void)processChunk:(NSData *)chunk atPosition:(long long)position {
+    // Your custom chunk processing logic here
+    // For example, you could:
+    // - Decrypt the chunk
+    // - Apply audio effects
+    // - Log streaming progress
+    // - Send chunk data to React Native
+    
+    if (hasListeners) {
+        NSString *base64Data = [chunk base64EncodedStringWithOptions:0];
+        NSDictionary *chunkData = @{
+            @"chunkSize": @(chunk.length),
+            @"position": @(position),
+            @"data": base64Data
+        };
+        [self sendEventWithName:EVENT_CHUNK_RECEIVED body:chunkData];
+    }
 }
 
 @end

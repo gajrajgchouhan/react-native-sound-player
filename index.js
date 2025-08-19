@@ -4,7 +4,7 @@
 "use strict";
 
 import { NativeModules, NativeEventEmitter, Platform } from "react-native";
-import resolveAsset from 'react-native/Libraries/Image/resolveAssetSource';
+import resolveAsset from "react-native/Libraries/Image/resolveAssetSource";
 const { RNSoundPlayer } = NativeModules;
 
 const _soundPlayerEmitter = new NativeEventEmitter(RNSoundPlayer);
@@ -12,59 +12,67 @@ let _finishedPlayingListener = null;
 let _finishedLoadingListener = null;
 
 export default {
-  playSoundFile: (name: string, type: string) => {
+  playSoundFile: (name, type) => {
     RNSoundPlayer.playSoundFile(name, type);
   },
 
-  playSoundFileWithDelay: (name: string, type: string, delay: number) => {
+  playSoundFileWithDelay: (name, type, delay) => {
     RNSoundPlayer.playSoundFileWithDelay(name, type, delay);
   },
 
-  loadSoundFile: (name: string, type: string) => {
+  loadSoundFile: (name, type) => {
     RNSoundPlayer.loadSoundFile(name, type);
   },
 
-  setNumberOfLoops: (loops: number) => {
+  setNumberOfLoops: (loops) => {
     RNSoundPlayer.setNumberOfLoops(loops);
   },
 
-  playUrl: (url: string) => {
+  playUrl: (url) => {
     RNSoundPlayer.playUrl(url);
   },
 
-  loadUrl: (url: string) => {
+  loadUrl: (url) => {
     RNSoundPlayer.loadUrl(url);
   },
-  
-  playAsset: async (asset: number) => {
-    if (!(__DEV__) && Platform.OS === "android") {
-      RNSoundPlayer.playSoundFile(resolveAsset(asset).uri, '');
-    } else {
-      RNSoundPlayer.playUrl(resolveAsset(asset).uri); 
-    } 
+
+  playUrlWithStreaming: (url) => {
+    RNSoundPlayer.playUrlWithStreaming(url);
   },
-  
-  loadAsset: (asset: number) => {
-    if (!(__DEV__) && Platform.OS === "android") {
-      RNSoundPlayer.loadSoundFile(resolveAsset(asset).uri, '');
+
+  loadUrlWithStreaming: (url) => {
+    RNSoundPlayer.loadUrlWithStreaming(url);
+  },
+
+  playAsset: async (asset) => {
+    if (!__DEV__ && Platform.OS === "android") {
+      RNSoundPlayer.playSoundFile(resolveAsset(asset).uri, "");
     } else {
-      RNSoundPlayer.loadUrl(resolveAsset(asset).uri); 
+      RNSoundPlayer.playUrl(resolveAsset(asset).uri);
     }
   },
 
-  onFinishedPlaying: (callback: (success: boolean) => any) => {
+  loadAsset: (asset) => {
+    if (!__DEV__ && Platform.OS === "android") {
+      RNSoundPlayer.loadSoundFile(resolveAsset(asset).uri, "");
+    } else {
+      RNSoundPlayer.loadUrl(resolveAsset(asset).uri);
+    }
+  },
+
+  onFinishedPlaying: (callback) => {
     if (_finishedPlayingListener) {
       _finishedPlayingListener.remove();
       _finishedPlayingListener = undefined;
     }
 
     _finishedPlayingListener = _soundPlayerEmitter.addListener(
-        "FinishedPlaying",
-        callback
+      "FinishedPlaying",
+      callback
     );
   },
 
-  onFinishedLoading: (callback: (success: boolean) => any) => {
+  onFinishedLoading: (callback) => {
     if (_finishedLoadingListener) {
       _finishedLoadingListener.remove();
       _finishedLoadingListener = undefined;
@@ -76,15 +84,8 @@ export default {
     );
   },
 
-  addEventListener: (
-    eventName:
-      | "OnSetupError"
-      | "FinishedLoading"
-      | "FinishedPlaying"
-      | "FinishedLoadingURL"
-      | "FinishedLoadingFile",
-    callback: Function
-  ) => _soundPlayerEmitter.addListener(eventName, callback),
+  addEventListener: (eventName, callback) =>
+    _soundPlayerEmitter.addListener(eventName, callback),
 
   play: () => {
     // play and resume has the exact same implementation natively
@@ -103,19 +104,19 @@ export default {
     RNSoundPlayer.stop();
   },
 
-  seek: (seconds: number) => {
+  seek: (seconds) => {
     RNSoundPlayer.seek(seconds);
   },
 
-  setVolume: (volume: number) => {
+  setVolume: (volume) => {
     RNSoundPlayer.setVolume(volume);
   },
 
-  setSpeaker: (on: boolean) => {
+  setSpeaker: (on) => {
     RNSoundPlayer.setSpeaker(on);
   },
 
-  setMixAudio: (on: boolean) => {
+  setMixAudio: (on) => {
     if (Platform.OS === "android") {
       console.log("setMixAudio is not implemented on Android");
     } else {
