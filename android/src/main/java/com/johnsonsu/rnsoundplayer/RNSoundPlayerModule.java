@@ -11,6 +11,7 @@ import java.net.URL;
 import java.net.HttpURLConnection;
 import java.io.InputStream;
 import java.io.ByteArrayOutputStream;
+import android.util.Log;
 
 import java.io.File;
 
@@ -375,6 +376,7 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
     
     @Override
     public int readAt(long position, byte[] buffer, int offset, int size) throws IOException {
+      Log.d("StreamingMediaDataSource", "readAt: " + position + ", offset: " + offset + ", size: " + size);
       // Initialize connection if needed
       if (connection == null) {
         connection = createConnection();
