@@ -381,6 +381,8 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
       if (connection == null) {
         connection = createConnection();
       }
+
+      Log.d("StreamingMediaDataSource", "connection: " + connection);
       
       // Handle range request for seeking
       if (position != 0) {
@@ -391,10 +393,14 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
       }
       
       InputStream inputStream = connection.getInputStream();
+
+      Log.d("StreamingMediaDataSource", "inputStream: " + inputStream);
       
       // Process chunks here - you can add your custom logic
       byte[] chunk = new byte[size];
       int bytesRead = inputStream.read(chunk, 0, size);
+
+      Log.d("StreamingMediaDataSource", "bytesRead: " + bytesRead);
       
       if (bytesRead > 0) {
         // Here you can process the chunk before returning it
