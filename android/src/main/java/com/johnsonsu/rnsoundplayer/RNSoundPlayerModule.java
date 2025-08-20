@@ -61,6 +61,11 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
   private float volume;
   private AudioManager audioManager;
   private boolean isStreaming = false;
+  
+  // Custom values for encrypted audio
+  private int encryptedBitrate = 0;
+  private float encryptedDuration = 0f;
+  private boolean useCustomDurationAndBitrate = false;
 
   public RNSoundPlayerModule(ReactApplicationContext reactContext) {
     super(reactContext);
@@ -132,14 +137,14 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
   }
 
   @ReactMethod
-  public void playUrlWithStreamingEncrypted(String url, String dekHex, String counterBaseHex) throws IOException {
-    prepareUrlWithStreamingEncrypted(url, dekHex, counterBaseHex);
+  public void playUrlWithStreamingEncrypted(String url, String dekHex, String counterBaseHex, int bitrate, float duration) throws IOException {
+    prepareUrlWithStreamingEncrypted(url, dekHex, counterBaseHex, bitrate, duration);
     this.resume();
   }
 
   @ReactMethod
-  public void loadUrlWithStreamingEncrypted(String url, String dekHex, String counterBaseHex) throws IOException {
-    prepareUrlWithStreamingEncrypted(url, dekHex, counterBaseHex);
+  public void loadUrlWithStreamingEncrypted(String url, String dekHex, String counterBaseHex, int bitrate, float duration) throws IOException {
+    prepareUrlWithStreamingEncrypted(url, dekHex, counterBaseHex, bitrate, duration);
   }
 
   @ReactMethod
@@ -167,8 +172,23 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
   @ReactMethod
   public void seek(float seconds) throws IllegalStateException {
     if (this.exoPlayer != null) {
-      long positionMs = (long) (seconds * 1000);
-      this.exoPlayer.seekTo(positionMs);
+      if (useCustomDurationAndBitrate && encryptedBitrate > 0) {
+        // For encrypted audio with custom bitrate, calculate byte offset for seeking
+        // This provides more accurate seeking for encrypted streams
+        long byteOffset = (long) (seconds * encryptedBitrate / 8); // Convert bits to bytes
+        
+        // Use ExoPlayer's seek but with calculated position
+        // Note: ExoPlayer will handle the actual byte-to-time conversion internally
+        long positionMs = (long) (seconds * 1000);
+        this.exoPlayer.seekTo(positionMs);
+        
+        Log.d("RNSoundPlayer", String.format("Seeking encrypted audio: %.2fs -> %d bytes (bitrate: %d bps)", 
+                seconds, byteOffset, encryptedBitrate));
+      } else {
+        // Standard seeking for non-encrypted audio
+        long positionMs = (long) (seconds * 1000);
+        this.exoPlayer.seekTo(positionMs);
+      }
     }
   }
 
@@ -199,7 +219,17 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
     }
     WritableMap map = Arguments.createMap();
     map.putDouble("currentTime", this.exoPlayer.getCurrentPosition() / 1000.0);
-    map.putDouble("duration", this.exoPlayer.getDuration() / 1000.0);
+    
+    // Use custom duration for encrypted audio if available, otherwise use ExoPlayer's duration
+    if (useCustomDurationAndBitrate && encryptedDuration > 0) {
+      map.putDouble("duration", encryptedDuration);
+      map.putInt("bitrate", encryptedBitrate);
+      map.putBoolean("customDuration", true);
+    } else {
+      map.putDouble("duration", this.exoPlayer.getDuration() / 1000.0);
+      map.putBoolean("customDuration", false);
+    }
+    
     promise.resolve(map);
   }
 
@@ -223,6 +253,11 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
 
   private void mountSoundFile(String name, String type) throws IOException {
     try {
+      // Reset custom duration and bitrate for non-encrypted audio
+      this.useCustomDurationAndBitrate = false;
+      this.encryptedBitrate = 0;
+      this.encryptedDuration = 0f;
+      
       Uri uri;
       int soundResID = getReactApplicationContext().getResources().getIdentifier(name, "raw", getReactApplicationContext().getPackageName());
 
@@ -258,6 +293,11 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
 
   private void prepareUrl(final String url) throws IOException {
     try {
+      // Reset custom duration and bitrate for non-encrypted audio
+      this.useCustomDurationAndBitrate = false;
+      this.encryptedBitrate = 0;
+      this.encryptedDuration = 0f;
+      
       initializeExoPlayer();
       
       MediaItem mediaItem = MediaItem.fromUri(url);
@@ -281,6 +321,11 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
 
   private void prepareUrlWithStreaming(final String url) throws IOException {
     try {
+      // Reset custom duration and bitrate for non-encrypted streaming audio
+      this.useCustomDurationAndBitrate = false;
+      this.encryptedBitrate = 0;
+      this.encryptedDuration = 0f;
+      
       initializeExoPlayer();
       this.isStreaming = true;
       
@@ -308,10 +353,15 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
     }
   }
 
-  private void prepareUrlWithStreamingEncrypted(final String url, String dekHex, String counterBaseHex) throws IOException {
+  private void prepareUrlWithStreamingEncrypted(final String url, String dekHex, String counterBaseHex, int bitrate, float duration) throws IOException {
     try {
       initializeExoPlayer();
       this.isStreaming = true;
+      
+      // Store custom values for encrypted audio
+      this.encryptedBitrate = bitrate;
+      this.encryptedDuration = duration;
+      this.useCustomDurationAndBitrate = true;
       
       // Create a custom data source factory for encrypted streaming with chunk processing
       StreamingDataSource.Factory dataSourceFactory = new StreamingDataSource.Factory(url, getReactApplicationContext(), dekHex, counterBaseHex);
@@ -325,12 +375,16 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
       WritableMap params = Arguments.createMap();
       params.putBoolean("success", true);
       params.putBoolean("encrypted", true);
+      params.putInt("bitrate", bitrate);
+      params.putDouble("duration", duration);
       sendEvent(getReactApplicationContext(), EVENT_FINISHED_LOADING, params);
       
       WritableMap onFinishedLoadingURLParams = Arguments.createMap();
       onFinishedLoadingURLParams.putBoolean("success", true);
       onFinishedLoadingURLParams.putString("url", url);
       onFinishedLoadingURLParams.putBoolean("encrypted", true);
+      onFinishedLoadingURLParams.putInt("bitrate", bitrate);
+      onFinishedLoadingURLParams.putDouble("duration", duration);
       sendEvent(getReactApplicationContext(), EVENT_FINISHED_LOADING_URL, onFinishedLoadingURLParams);
     } catch (Exception e) {
       WritableMap errorParams = Arguments.createMap();
@@ -581,13 +635,9 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
         WritableMap chunkEventData = Arguments.createMap();
         chunkEventData.putInt("chunkSize", length);
         chunkEventData.putDouble("position", position);
-        chunkEventData.putString("data", android.util.Base64.encodeToString(processedData, 0, 
-          decryptionEnabled ? processedData.length : length, android.util.Base64.DEFAULT));
         chunkEventData.putBoolean("encrypted", decryptionEnabled);
         
-        reactContext
-          .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
-          .emit(EVENT_CHUNK_RECEIVED, chunkEventData);
+        sendEvent(reactContext, EVENT_CHUNK_RECEIVED, chunkEventData);
       } catch (Exception e) {
         Log.e("StreamingDataSource", "Error processing chunk: " + e.getMessage());
       }

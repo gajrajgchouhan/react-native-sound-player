@@ -20,6 +20,7 @@ declare module "react-native-sound-player" {
     encrypted?: boolean;
     isLoading?: boolean;
     duration?: number;
+    bitrate?: number;
   };
 
   interface SoundPlayerType {
@@ -33,12 +34,16 @@ declare module "react-native-sound-player" {
     playUrlWithStreamingEncrypted: (
       url: string,
       dekHex: string,
-      counterBaseHex: string
+      counterBaseHex: string,
+      bitrate: number,
+      duration: number
     ) => void;
     loadUrlWithStreamingEncrypted: (
       url: string,
       dekHex: string,
-      counterBaseHex: string
+      counterBaseHex: string,
+      bitrate: number,
+      duration: number
     ) => void;
     playAsset: (asset: number) => void;
     loadAsset: (asset: number) => void;
@@ -69,8 +74,13 @@ declare module "react-native-sound-player" {
     setMixAudio: (on: boolean) => void;
     /** iOS: 0 means to play the sound once, a positive number specifies the number of times to return to the start and play again, a negative number indicates an indefinite loop. Android: 0 means to play the sound once, other numbers indicate an indefinite loop. */
     setNumberOfLoops: (loops: number) => void;
-    /** Get the currentTime and duration of the currently mounted audio media. This function returns a promise which resolves to an Object containing currentTime and duration properties. */
-    getInfo: () => Promise<{ currentTime: number; duration: number }>;
+    /** Get the currentTime and duration of the currently mounted audio media. This function returns a promise which resolves to an Object containing currentTime and duration properties. For encrypted streams, also includes bitrate and customDuration fields. */
+    getInfo: () => Promise<{
+      currentTime: number;
+      duration: number;
+      bitrate?: number;
+      customDuration?: boolean;
+    }>;
     /** @deprecated Please use addEventListener and remove your own listener by calling yourSubscriptionObject.remove(). */
     unmount: () => void;
   }
