@@ -44,6 +44,8 @@ import javax.crypto.Cipher;
 import javax.crypto.spec.SecretKeySpec;
 import javax.crypto.spec.IvParameterSpec;
 import java.security.Security;
+import java.util.Arrays;
+
 import com.google.android.exoplayer2.PlaybackException;
 import com.google.android.exoplayer2.audio.AudioAttributes;
 import com.google.android.exoplayer2.C;
@@ -371,7 +373,7 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
               .createMediaSource(MediaItem.fromUri(url));
       
       this.exoPlayer.setMediaSource(mediaSource);
-      this.exoPlayer.prepareAsync();
+      this.exoPlayer.prepare();
       
       WritableMap params = Arguments.createMap();
       params.putBoolean("success", true);
@@ -497,6 +499,12 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
     private boolean decryptionEnabled = false;
     private long totalBytesRead = 0;
     
+    // Header buffering fields
+    private static final int HEADER_BUFFER_SIZE = 8192; // Enough for most audio headers
+    private ByteArrayOutputStream headerBuffer = new ByteArrayOutputStream();
+    private boolean headersReady = false;
+    private int headerBytesConsumed = 0; // Track how much of header buffer we've given to ExoPlayer
+    
     // Reusable objects to prevent memory allocations
     private Cipher cipher;
     private byte[] reusableCounter;
@@ -555,6 +563,11 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
       this.dataSpec = alignedDataSpec;
       this.opened = true;
       this.totalBytesRead = 0; // Reset counter for new stream
+      
+      // Reset header buffering state for new stream
+      this.headerBuffer.reset();
+      this.headersReady = false;
+      this.headerBytesConsumed = 0;
 
       try {
         connection = createConnection();
@@ -614,7 +627,100 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
         return C.RESULT_END_OF_INPUT;
       }
 
+      if (!headersReady) {
+        // Keep buffering until we have enough header data
+        try {
+          bufferHeaderData(readLength);
+          
+          if (headerBuffer.size() >= HEADER_BUFFER_SIZE) {
+            headersReady = true;
+            Log.d("StreamingDataSource", "Headers buffered (" + headerBuffer.size() + " bytes), ready for ExoPlayer");
+          } else {
+            // Return 0 to make ExoPlayer wait
+            Log.d("StreamingDataSource", "Buffering headers: " + headerBuffer.size() + "/" + HEADER_BUFFER_SIZE + " bytes");
+            return 0;
+          }
+        } catch (IOException e) {
+          throw new HttpDataSource.HttpDataSourceException(
+            "Header buffering error", 
+            e, 
+            dataSpec, 
+            HttpDataSource.HttpDataSourceException.TYPE_READ
+          );
+        }
+      }
+      
+             // Now proceed with normal reading
+       return performNormalRead(buffer, offset, readLength);
+     }
+
+    private void bufferHeaderData(int requestedLength) throws IOException {
+      // Only buffer if we haven't reached our target size
+      if (headerBuffer.size() >= HEADER_BUFFER_SIZE) {
+        return;
+      }
+      
+      int bytesToBuffer = Math.min(requestedLength, HEADER_BUFFER_SIZE - headerBuffer.size());
+      byte[] tempBuffer = new byte[bytesToBuffer];
+      
+      int bytesRead = inputStream.read(tempBuffer, 0, bytesToBuffer);
+      if (bytesRead > 0) {
+        if (decryptionEnabled) {
+          // For encrypted streams, decrypt the header data as we buffer it
+          long actualStreamPosition = dataSpec.position + totalBytesRead;
+          System.arraycopy(tempBuffer, 0, encryptedBuffer, 0, bytesRead);
+          int decryptedBytes = decryptChunkToSeparateBuffer(bytesRead, actualStreamPosition);
+          
+          // Add decrypted data to header buffer
+          headerBuffer.write(decryptedBuffer, 0, decryptedBytes);
+          
+          // Update counters
+          if (bytesRemaining != C.LENGTH_UNSET) {
+            bytesRemaining -= bytesRead;
+          }
+          totalBytesRead += bytesRead;
+          
+          Log.d("StreamingDataSource", String.format("Buffered %d encrypted->%d decrypted header bytes", bytesRead, decryptedBytes));
+        } else {
+          // For non-encrypted streams, buffer data directly
+          headerBuffer.write(tempBuffer, 0, bytesRead);
+          
+          // Update counters
+          if (bytesRemaining != C.LENGTH_UNSET) {
+            bytesRemaining -= bytesRead;
+          }
+          totalBytesRead += bytesRead;
+          
+          Log.d("StreamingDataSource", String.format("Buffered %d header bytes", bytesRead));
+        }
+        
+        // Check if headers are now complete and debug if so
+        if (headerBuffer.size() >= HEADER_BUFFER_SIZE) {
+          Log.d("StreamingDataSource", "=== HEADERS COMPLETE - DEBUGGING DECRYPTED DATA ===");
+          byte[] headerData = headerBuffer.toByteArray();
+          debugDecryptedData(headerData, headerData.length);
+        }
+      }
+    }
+
+    private int performNormalRead(byte[] buffer, int offset, int readLength) throws HttpDataSource.HttpDataSourceException {
       try {
+        // First, serve any remaining header data
+        if (headerBytesConsumed < headerBuffer.size()) {
+          byte[] headerData = headerBuffer.toByteArray();
+          int availableHeaderBytes = headerBuffer.size() - headerBytesConsumed;
+          int headerBytesToReturn = Math.min(readLength, availableHeaderBytes);
+          
+          System.arraycopy(headerData, headerBytesConsumed, buffer, offset, headerBytesToReturn);
+          headerBytesConsumed += headerBytesToReturn;
+          
+          Log.d("StreamingDataSource", String.format("Served %d bytes from header buffer (%d/%d consumed)", 
+                headerBytesToReturn, headerBytesConsumed, headerBuffer.size()));
+          
+          return headerBytesToReturn;
+        }
+        
+        // Header data exhausted, proceed with normal streaming
         // Limit chunk size for encrypted streams to prevent memory issues
         int bytesToRead = bytesRemaining != C.LENGTH_UNSET ? 
           (int) Math.min(readLength, bytesRemaining) : readLength;
@@ -705,6 +811,13 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
           java.util.Arrays.fill(decryptedBuffer, (byte) 0);
         }
         
+        // Clear header buffer
+        if (headerBuffer != null) {
+          headerBuffer.reset();
+        }
+        headersReady = false;
+        headerBytesConsumed = 0;
+        
         opened = false;
       } catch (IOException e) {
         throw new HttpDataSource.HttpDataSourceException(
@@ -754,56 +867,137 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
     }
 
     // Optimized method that decrypts from encrypted buffer to decrypted buffer
-    private int decryptChunkToSeparateBuffer(int length, long currentOffset) {
-      try {
-        if (!decryptionEnabled || cipher == null || dekKey == null || counterBase == null) {
-          // If decryption is not enabled, copy encrypted data to decrypted buffer
-          System.arraycopy(encryptedBuffer, 0, decryptedBuffer, 0, length);
-          return length;
-        }
-        
-        // Calculate counter for this chunk based on offset - reuse array
-        updateCounter(reusableCounter, counterBase, currentOffset);
-        
-        // Create IV parameter spec for AES-CTR
-        IvParameterSpec ivSpec = new IvParameterSpec(reusableCounter);
-        
-        // Reinitialize cipher with new IV
-        cipher.init(Cipher.DECRYPT_MODE, dekKey, ivSpec);
-        
-        // Decrypt from encrypted buffer directly to decrypted buffer
-        int decryptedBytes = cipher.doFinal(encryptedBuffer, 0, length, decryptedBuffer, 0);
-
-        // Log decryption success with position info for debugging
-        Log.d("StreamingDataSource", String.format("Decrypted %d bytes at position %d (blocks: %d)", 
-              decryptedBytes, currentOffset, currentOffset / AES_BLOCK_SIZE));
-
-        return decryptedBytes;
-        
-      } catch (Exception e) {
-        Log.e("StreamingDataSource", "Decryption failed: " + e.getMessage());
-        // Fallback: copy encrypted data to decrypted buffer if decryption fails
-        System.arraycopy(encryptedBuffer, 0, decryptedBuffer, 0, length);
-        return length;
-      }
+private int decryptChunkToSeparateBuffer(int length, long currentOffset) {
+  try {
+    Log.d("StreamingDataSource", String.format("=== DECRYPT CHUNK START ==="));
+    Log.d("StreamingDataSource", String.format("Input params: length=%d, currentOffset=%d", length, currentOffset));
+    Log.d("StreamingDataSource", String.format("Decryption enabled: %b", decryptionEnabled));
+    
+    if (!decryptionEnabled || cipher == null || dekKey == null || counterBase == null) {
+      Log.w("StreamingDataSource", "Decryption disabled or missing components - copying raw data");
+      Log.d("StreamingDataSource", String.format("cipher null: %b, dekKey null: %b, counterBase null: %b", 
+            cipher == null, dekKey == null, counterBase == null));
+      // If decryption is not enabled, copy encrypted data to decrypted buffer
+      System.arraycopy(encryptedBuffer, 0, decryptedBuffer, 0, length);
+      return length;
     }
     
-    // Optimized method that updates counter in-place
-    private void updateCounter(byte[] targetCounter, byte[] baseCounter, long offset) {
-      // Copy base counter to target
-      System.arraycopy(baseCounter, 0, targetCounter, 0, baseCounter.length);
-      
-      // Calculate number of 16-byte blocks (AES block size)
-      long blocks = offset / 16;
-      
-      // Add blocks to counter (big-endian) - reuse existing array
-      long carry = blocks;
-      for (int i = targetCounter.length - 1; i >= 0 && carry > 0; i--) {
-        long sum = (targetCounter[i] & 0xff) + (carry & 0xff);
-        targetCounter[i] = (byte) (sum & 0xff);
-        carry = (carry >>> 8) + (sum >>> 8);
-      }
+    // Log input encrypted data
+    StringBuilder encryptedHex = new StringBuilder();
+    StringBuilder encryptedDec = new StringBuilder();
+    for (int i = 0; i < Math.min(length, 20); i++) {
+      encryptedHex.append(String.format("%02X ", encryptedBuffer[i] & 0xFF));
+      encryptedDec.append(String.format("%d, ", encryptedBuffer[i]));
     }
+    Log.d("StreamingDataSource", String.format("Encrypted input (first %d bytes hex): %s", 
+          Math.min(length, 20), encryptedHex.toString()));
+    Log.d("StreamingDataSource", String.format("Encrypted input (first %d bytes dec): %s", 
+          Math.min(length, 20), encryptedDec.toString()));
+    
+    // Log counter base before update
+    StringBuilder counterBaseHex = new StringBuilder();
+    for (int i = 0; i < counterBase.length; i++) {
+      counterBaseHex.append(String.format("%02X ", counterBase[i] & 0xFF));
+    }
+    Log.d("StreamingDataSource", String.format("Counter base: %s", counterBaseHex.toString()));
+    
+    // Calculate counter for this chunk based on offset - reuse array
+    updateCounter(reusableCounter, counterBase, currentOffset);
+    
+    // Log the calculated counter/IV
+    StringBuilder counterHex = new StringBuilder();
+    StringBuilder counterDec = new StringBuilder();
+    for (int i = 0; i < reusableCounter.length; i++) {
+      counterHex.append(String.format("%02X ", reusableCounter[i] & 0xFF));
+      counterDec.append(String.format("%d, ", reusableCounter[i]));
+    }
+    Log.d("StreamingDataSource", String.format("Calculated IV/Counter (hex): %s", counterHex.toString()));
+    Log.d("StreamingDataSource", String.format("Calculated IV/Counter (dec): %s", counterDec.toString()));
+    
+    // Log DEK key info (first few bytes only for security)
+    if (dekKey != null && dekKey.getEncoded() != null) {
+      byte[] keyBytes = dekKey.getEncoded();
+      StringBuilder keyHex = new StringBuilder();
+      for (int i = 0; i < Math.min(8, keyBytes.length); i++) {
+        keyHex.append(String.format("%02X ", keyBytes[i] & 0xFF));
+      }
+      Log.d("StreamingDataSource", String.format("DEK Key (first 8 bytes): %s... (algorithm: %s, format: %s)", 
+            keyHex.toString(), dekKey.getAlgorithm(), dekKey.getFormat()));
+    }
+    
+    // Create IV parameter spec for AES-CTR
+    IvParameterSpec ivSpec = new IvParameterSpec(reusableCounter);
+    
+    // Log cipher info before init
+    Log.d("StreamingDataSource", String.format("Cipher algorithm: %s", cipher.getAlgorithm()));
+    Log.d("StreamingDataSource", String.format("Block size: %d, AES_BLOCK_SIZE constant: %d", 
+          cipher.getBlockSize(), AES_BLOCK_SIZE));
+    
+    // Reinitialize cipher with new IV
+    cipher.init(Cipher.DECRYPT_MODE, dekKey, ivSpec);
+    Log.d("StreamingDataSource", "Cipher reinitialized successfully");
+
+    StringBuilder encryptedInputHex = new StringBuilder();
+StringBuilder encryptedInputDec = new StringBuilder();
+for (int i = 0; i < Math.min(length, 16); i++) {
+  encryptedInputHex.append(String.format("%02X ", encryptedBuffer[i] & 0xFF));
+  encryptedInputDec.append(String.format("%d, ", encryptedBuffer[i]));
+}
+Log.d("StreamingDataSource", String.format("ENCRYPTED INPUT (hex): %s", encryptedInputHex.toString()));
+Log.d("StreamingDataSource", String.format("ENCRYPTED INPUT (dec): %s", encryptedInputDec.toString()));
+    
+    // Decrypt from encrypted buffer directly to decrypted buffer
+    int decryptedBytes = cipher.doFinal(encryptedBuffer, 0, length, decryptedBuffer, 0);
+    
+    // Log output decrypted data
+    StringBuilder decryptedHex = new StringBuilder();
+    StringBuilder decryptedDec = new StringBuilder();
+    for (int i = 0; i < Math.min(decryptedBytes, 20); i++) {
+      decryptedHex.append(String.format("%02X ", decryptedBuffer[i] & 0xFF));
+      decryptedDec.append(String.format("%d, ", decryptedBuffer[i]));
+    }
+    Log.d("StreamingDataSource", String.format("Decrypted output (first %d bytes hex): %s", 
+          Math.min(decryptedBytes, 20), decryptedHex.toString()));
+    Log.d("StreamingDataSource", String.format("Decrypted output (first %d bytes dec): %s", 
+          Math.min(decryptedBytes, 20), decryptedDec.toString()));
+
+    // Log decryption success with position info for debugging
+    Log.d("StreamingDataSource", String.format("✓ Decrypted %d bytes at offset %d (block: %d)", 
+          decryptedBytes, currentOffset, currentOffset / AES_BLOCK_SIZE));
+    Log.d("StreamingDataSource", String.format("=== DECRYPT CHUNK END ==="));
+
+    return decryptedBytes;
+    
+  } catch (Exception e) {
+    Log.e("StreamingDataSource", "Decryption failed: " + e.getMessage());
+    Log.e("StreamingDataSource", "Exception type: " + e.getClass().getSimpleName());
+    e.printStackTrace();
+    
+    // Log fallback action
+    Log.w("StreamingDataSource", "Falling back to copying encrypted data as-is");
+    System.arraycopy(encryptedBuffer, 0, decryptedBuffer, 0, length);
+    return length;
+  }
+}
+
+private void updateCounter(byte[] targetCounter, byte[] baseCounter, long offset) {
+    System.arraycopy(baseCounter, 0, targetCounter, 0, baseCounter.length);
+    
+    // Use BigInteger for safe arithmetic (Android equivalent of BigInt)
+    BigInteger counter = new BigInteger(1, baseCounter);
+    BigInteger blockOffset = BigInteger.valueOf(offset / 16);
+    BigInteger result = counter.add(blockOffset);
+    
+    byte[] resultBytes = result.toByteArray();
+    
+    // Handle potential leading zero byte from BigInteger
+    int srcPos = resultBytes.length > baseCounter.length ? 1 : 0;
+    int copyLen = Math.min(resultBytes.length - srcPos, baseCounter.length);
+    int destPos = baseCounter.length - copyLen;
+    
+    Arrays.fill(targetCounter, (byte) 0);
+    System.arraycopy(resultBytes, srcPos, targetCounter, destPos, copyLen);
+}
     
     // Lightweight method to send chunk events
     private void sendChunkEvent(int length, long position) {
@@ -819,6 +1013,21 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
       } catch (Exception e) {
         Log.e("StreamingDataSource", "Error sending chunk event: " + e.getMessage());
       }
+    }
+    
+    // After decryption, log the first 32 bytes as both hex and ASCII
+    private void debugDecryptedData(byte[] data, int length) {
+      StringBuilder hex = new StringBuilder();
+      StringBuilder ascii = new StringBuilder();
+      
+      for (int i = 0; i < Math.min(length, 32); i++) {
+        hex.append(String.format("%02X ", data[i] & 0xFF));
+        char c = (data[i] >= 32 && data[i] < 127) ? (char)data[i] : '.';
+        ascii.append(c);
+      }
+      
+      Log.d("StreamingDataSource", "Decrypted HEX:   " + hex.toString());
+      Log.d("StreamingDataSource", "Decrypted ASCII: " + ascii.toString());
     }
     
     private byte[] hexToByteArray(String hex) {
