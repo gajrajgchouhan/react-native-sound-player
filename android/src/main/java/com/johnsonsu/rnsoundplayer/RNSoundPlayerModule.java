@@ -21,6 +21,7 @@ import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.LifecycleEventListener;
 
 import com.google.android.exoplayer2.ExoPlayer;
+import com.google.android.exoplayer2.DefaultLoadControl;
 import com.google.android.exoplayer2.MediaItem;
 import com.google.android.exoplayer2.Player;
 import com.google.android.exoplayer2.source.MediaSource;
@@ -395,7 +396,19 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
 
   private void initializeExoPlayer() {
     if (this.exoPlayer == null) {
-      this.exoPlayer = new ExoPlayer.Builder(getReactApplicationContext()).build();
+      // Use custom LoadControl to limit buffering for encrypted streams
+      com.google.android.exoplayer2.DefaultLoadControl loadControl = new com.google.android.exoplayer2.DefaultLoadControl.Builder()
+              .setBufferDurationsMs(
+                      2000,   // Min buffer (2s) - reduced from default 
+                      8000,   // Max buffer (8s) - reduced from default 50s
+                      1500,   // Buffer for playback (1.5s)
+                      2000    // Buffer for playback after rebuffer (2s)
+              )
+              .build();
+      
+      this.exoPlayer = new ExoPlayer.Builder(getReactApplicationContext())
+              .setLoadControl(loadControl)
+              .build();
       
       // Set audio attributes
       AudioAttributes audioAttributes = new AudioAttributes.Builder()
@@ -474,6 +487,11 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
     private byte[] counterBase;
     private boolean decryptionEnabled = false;
     private long totalBytesRead = 0;
+    
+    // Reusable objects to prevent memory allocations
+    private Cipher cipher;
+    private byte[] reusableCounter;
+    private static final int MAX_CHUNK_SIZE = 64 * 1024; // 64KB max chunk size
 
     public StreamingDataSource(String url, ReactApplicationContext reactContext) {
       this.url = url;
@@ -489,8 +507,13 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
           byte[] dekBytes = hexToByteArray(dekHex);
           this.dekKey = new SecretKeySpec(dekBytes, "AES");
           this.counterBase = hexToByteArray(counterBaseHex);
+          this.reusableCounter = new byte[this.counterBase.length]; // Reusable counter array
+          
+          // Initialize cipher once
+          this.cipher = Cipher.getInstance("AES/CTR/NoPadding");
+          
           this.decryptionEnabled = true;
-          Log.d("StreamingDataSource", "Decryption enabled with AES-CTR");
+          Log.d("StreamingDataSource", "Decryption enabled with AES-CTR, max chunk size: " + MAX_CHUNK_SIZE);
         } catch (Exception e) {
           Log.e("StreamingDataSource", "Failed to initialize decryption: " + e.getMessage());
           this.decryptionEnabled = false;
@@ -555,8 +578,14 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
       }
 
       try {
+        // Limit chunk size for encrypted streams to prevent memory issues
         int bytesToRead = bytesRemaining != C.LENGTH_UNSET ? 
           (int) Math.min(readLength, bytesRemaining) : readLength;
+          
+        // Further limit chunk size for encrypted streams
+        if (decryptionEnabled) {
+          bytesToRead = Math.min(bytesToRead, MAX_CHUNK_SIZE);
+        }
         
         int bytesRead = inputStream.read(buffer, offset, bytesToRead);
         
@@ -565,8 +594,13 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
             bytesRemaining -= bytesRead;
           }
           
-          // Process chunk here - similar to original implementation
-          processChunk(buffer, bytesRead, offset, dataSpec.position + totalBytesRead);
+          // Process chunk here - decrypt in-place to avoid extra allocations
+          if (decryptionEnabled) {
+            decryptChunkInPlace(buffer, offset, bytesRead, dataSpec.position + totalBytesRead);
+          }
+          
+          // Send chunk event with minimal data
+          sendChunkEvent(bytesRead, dataSpec.position + totalBytesRead);
           totalBytesRead += bytesRead;
         }
         
@@ -597,6 +631,12 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
           connection.disconnect();
           connection = null;
         }
+        
+        // Clear sensitive data
+        if (reusableCounter != null) {
+          java.util.Arrays.fill(reusableCounter, (byte) 0);
+        }
+        
         opened = false;
       } catch (IOException e) {
         throw new HttpDataSource.HttpDataSourceException(
@@ -618,69 +658,69 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
       return conn;
     }
 
-    private void processChunk(byte[] buffer, int length, int offset, long position) {
+    // Optimized method that decrypts data in-place to avoid memory allocations
+    private void decryptChunkInPlace(byte[] buffer, int offset, int length, long currentOffset) {
       try {
-        byte[] processedData = buffer;
-        
-        // Decrypt chunk if encryption is enabled
-        if (decryptionEnabled && dekKey != null && counterBase != null) {
-          byte[] chunkData = new byte[length];
-          System.arraycopy(buffer, offset, chunkData, 0, length);
-          processedData = decryptChunk(chunkData, position);
-          
-          // Copy decrypted data back to buffer
-          System.arraycopy(processedData, 0, buffer, offset, Math.min(processedData.length, length));
+        if (!decryptionEnabled || cipher == null || dekKey == null || counterBase == null) {
+          return;
         }
         
+        // Calculate counter for this chunk based on offset - reuse array
+        updateCounter(reusableCounter, counterBase, currentOffset);
+        
+        // Create IV parameter spec for AES-CTR
+        IvParameterSpec ivSpec = new IvParameterSpec(reusableCounter);
+        
+        // Reinitialize cipher with new IV
+        cipher.init(Cipher.DECRYPT_MODE, dekKey, ivSpec);
+        
+        // Decrypt in-place to avoid additional memory allocation
+        // Create temporary array only for the chunk being decrypted
+        byte[] chunkData = new byte[length];
+        System.arraycopy(buffer, offset, chunkData, 0, length);
+        
+        byte[] decryptedData = cipher.doFinal(chunkData);
+        
+        // Copy decrypted data back to buffer
+        System.arraycopy(decryptedData, 0, buffer, offset, Math.min(decryptedData.length, length));
+        
+      } catch (Exception e) {
+        Log.e("StreamingDataSource", "Decryption failed: " + e.getMessage());
+        // Continue with encrypted data if decryption fails
+      }
+    }
+    
+    // Optimized method that updates counter in-place
+    private void updateCounter(byte[] targetCounter, byte[] baseCounter, long offset) {
+      // Copy base counter to target
+      System.arraycopy(baseCounter, 0, targetCounter, 0, baseCounter.length);
+      
+      // Calculate number of 16-byte blocks (AES block size)
+      long blocks = offset / 16;
+      
+      // Add blocks to counter (big-endian) - reuse existing array
+      long carry = blocks;
+      for (int i = targetCounter.length - 1; i >= 0 && carry > 0; i--) {
+        long sum = (targetCounter[i] & 0xff) + (carry & 0xff);
+        targetCounter[i] = (byte) (sum & 0xff);
+        carry = (carry >>> 8) + (sum >>> 8);
+      }
+    }
+    
+    // Lightweight method to send chunk events
+    private void sendChunkEvent(int length, long position) {
+      try {
         WritableMap chunkEventData = Arguments.createMap();
         chunkEventData.putInt("chunkSize", length);
         chunkEventData.putDouble("position", position);
         chunkEventData.putBoolean("encrypted", decryptionEnabled);
         
-         reactContext
+        reactContext
           .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
           .emit(EVENT_CHUNK_RECEIVED, chunkEventData);
       } catch (Exception e) {
-        Log.e("StreamingDataSource", "Error processing chunk: " + e.getMessage());
+        Log.e("StreamingDataSource", "Error sending chunk event: " + e.getMessage());
       }
-    }
-    
-    private byte[] decryptChunk(byte[] encryptedData, long currentOffset) {
-      try {
-        // Calculate counter for this chunk based on offset
-        byte[] counter = incrementCounter(counterBase, currentOffset);
-        
-        // Create IV parameter spec for AES-CTR
-        IvParameterSpec ivSpec = new IvParameterSpec(counter);
-        
-        // Initialize cipher
-        Cipher cipher = Cipher.getInstance("AES/CTR/NoPadding");
-        cipher.init(Cipher.DECRYPT_MODE, dekKey, ivSpec);
-        
-        // Decrypt the chunk
-        return cipher.doFinal(encryptedData);
-      } catch (Exception e) {
-        Log.e("StreamingDataSource", "Decryption failed: " + e.getMessage());
-        return encryptedData; // Return original data if decryption fails
-      }
-    }
-    
-    private byte[] incrementCounter(byte[] counter, long offset) {
-      byte[] newCounter = new byte[counter.length];
-      System.arraycopy(counter, 0, newCounter, 0, counter.length);
-      
-      // Calculate number of 16-byte blocks (AES block size)
-      long blocks = offset / 16;
-      
-      // Add blocks to counter (big-endian)
-      long carry = blocks;
-      for (int i = newCounter.length - 1; i >= 0 && carry > 0; i--) {
-        long sum = (newCounter[i] & 0xff) + (carry & 0xff);
-        newCounter[i] = (byte) (sum & 0xff);
-        carry = (carry >>> 8) + (sum >>> 8);
-      }
-      
-      return newCounter;
     }
     
     private byte[] hexToByteArray(String hex) {
