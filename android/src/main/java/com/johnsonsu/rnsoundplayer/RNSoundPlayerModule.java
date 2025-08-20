@@ -680,7 +680,10 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
         System.arraycopy(buffer, offset, chunkData, 0, length);
         
         byte[] decryptedData = cipher.doFinal(chunkData);
-        
+
+        // log the decrypted data in form of string
+        Log.d("StreamingDataSource", "Decrypted data: " + new String(decryptedData));
+
         // Copy decrypted data back to buffer
         System.arraycopy(decryptedData, 0, buffer, offset, Math.min(decryptedData.length, length));
         
