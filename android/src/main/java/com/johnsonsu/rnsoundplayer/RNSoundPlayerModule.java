@@ -38,6 +38,11 @@ import java.net.URL;
 import java.net.HttpURLConnection;
 import java.io.InputStream;
 import java.io.ByteArrayOutputStream;
+
+import javax.crypto.Cipher;
+import javax.crypto.spec.SecretKeySpec;
+import javax.crypto.spec.IvParameterSpec;
+import java.security.Security;
 import com.google.android.exoplayer2.PlaybackException;
 import com.google.android.exoplayer2.audio.AudioAttributes;
 import com.google.android.exoplayer2.C;
@@ -124,6 +129,17 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
   @ReactMethod
   public void loadUrlWithStreaming(String url) throws IOException {
     prepareUrlWithStreaming(url);
+  }
+
+  @ReactMethod
+  public void playUrlWithStreamingEncrypted(String url, String dekHex, String counterBaseHex) throws IOException {
+    prepareUrlWithStreamingEncrypted(url, dekHex, counterBaseHex);
+    this.resume();
+  }
+
+  @ReactMethod
+  public void loadUrlWithStreamingEncrypted(String url, String dekHex, String counterBaseHex) throws IOException {
+    prepareUrlWithStreamingEncrypted(url, dekHex, counterBaseHex);
   }
 
   @ReactMethod
@@ -292,6 +308,37 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
     }
   }
 
+  private void prepareUrlWithStreamingEncrypted(final String url, String dekHex, String counterBaseHex) throws IOException {
+    try {
+      initializeExoPlayer();
+      this.isStreaming = true;
+      
+      // Create a custom data source factory for encrypted streaming with chunk processing
+      StreamingDataSource.Factory dataSourceFactory = new StreamingDataSource.Factory(url, getReactApplicationContext(), dekHex, counterBaseHex);
+      
+      MediaSource mediaSource = new ProgressiveMediaSource.Factory(dataSourceFactory)
+              .createMediaSource(MediaItem.fromUri(url));
+      
+      this.exoPlayer.setMediaSource(mediaSource);
+      this.exoPlayer.prepare();
+      
+      WritableMap params = Arguments.createMap();
+      params.putBoolean("success", true);
+      params.putBoolean("encrypted", true);
+      sendEvent(getReactApplicationContext(), EVENT_FINISHED_LOADING, params);
+      
+      WritableMap onFinishedLoadingURLParams = Arguments.createMap();
+      onFinishedLoadingURLParams.putBoolean("success", true);
+      onFinishedLoadingURLParams.putString("url", url);
+      onFinishedLoadingURLParams.putBoolean("encrypted", true);
+      sendEvent(getReactApplicationContext(), EVENT_FINISHED_LOADING_URL, onFinishedLoadingURLParams);
+    } catch (Exception e) {
+      WritableMap errorParams = Arguments.createMap();
+      errorParams.putString("error", e.getMessage());
+      sendEvent(getReactApplicationContext(), EVENT_SETUP_ERROR, errorParams);
+    }
+  }
+
   private void initializeExoPlayer() {
     if (this.exoPlayer == null) {
       this.exoPlayer = new ExoPlayer.Builder(getReactApplicationContext()).build();
@@ -367,10 +414,34 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
     private long bytesRemaining;
     private boolean opened;
     private DataSpec dataSpec;
+    
+    // Decryption fields
+    private SecretKeySpec dekKey;
+    private byte[] counterBase;
+    private boolean decryptionEnabled = false;
+    private long totalBytesRead = 0;
 
     public StreamingDataSource(String url, ReactApplicationContext reactContext) {
       this.url = url;
       this.reactContext = reactContext;
+    }
+    
+    public StreamingDataSource(String url, ReactApplicationContext reactContext, String dekHex, String counterBaseHex) {
+      this.url = url;
+      this.reactContext = reactContext;
+      
+      if (dekHex != null && !dekHex.isEmpty() && counterBaseHex != null && !counterBaseHex.isEmpty()) {
+        try {
+          byte[] dekBytes = hexToByteArray(dekHex);
+          this.dekKey = new SecretKeySpec(dekBytes, "AES");
+          this.counterBase = hexToByteArray(counterBaseHex);
+          this.decryptionEnabled = true;
+          Log.d("StreamingDataSource", "Decryption enabled with AES-CTR");
+        } catch (Exception e) {
+          Log.e("StreamingDataSource", "Failed to initialize decryption: " + e.getMessage());
+          this.decryptionEnabled = false;
+        }
+      }
     }
 
     @Override
@@ -382,6 +453,7 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
     public long open(DataSpec dataSpec) throws HttpDataSource.HttpDataSourceException {
       this.dataSpec = dataSpec;
       this.opened = true;
+      this.totalBytesRead = 0; // Reset counter for new stream
 
       try {
         connection = createConnection();
@@ -440,7 +512,8 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
           }
           
           // Process chunk here - similar to original implementation
-          processChunk(buffer, bytesRead, offset, dataSpec.position);
+          processChunk(buffer, bytesRead, offset, dataSpec.position + totalBytesRead);
+          totalBytesRead += bytesRead;
         }
         
         return bytesRead;
@@ -492,39 +565,108 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
     }
 
     private void processChunk(byte[] buffer, int length, int offset, long position) {
-      // Your custom chunk processing logic here
-      // For example, you could:
-      // - Decrypt the chunk
-      // - Apply audio effects
-      // - Log streaming progress
-      // - Send chunk data to React Native
-      
       try {
-        WritableMap chunkData = Arguments.createMap();
-        chunkData.putInt("chunkSize", length);
-        chunkData.putDouble("position", position);
-        chunkData.putString("data", android.util.Base64.encodeToString(buffer, offset, length, android.util.Base64.DEFAULT));
+        byte[] processedData = buffer;
+        
+        // Decrypt chunk if encryption is enabled
+        if (decryptionEnabled && dekKey != null && counterBase != null) {
+          byte[] chunkData = new byte[length];
+          System.arraycopy(buffer, offset, chunkData, 0, length);
+          processedData = decryptChunk(chunkData, position);
+          
+          // Copy decrypted data back to buffer
+          System.arraycopy(processedData, 0, buffer, offset, Math.min(processedData.length, length));
+        }
+        
+        WritableMap chunkEventData = Arguments.createMap();
+        chunkEventData.putInt("chunkSize", length);
+        chunkEventData.putDouble("position", position);
+        chunkEventData.putString("data", android.util.Base64.encodeToString(processedData, 0, 
+          decryptionEnabled ? processedData.length : length, android.util.Base64.DEFAULT));
+        chunkEventData.putBoolean("encrypted", decryptionEnabled);
         
         reactContext
           .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
-          .emit(EVENT_CHUNK_RECEIVED, chunkData);
+          .emit(EVENT_CHUNK_RECEIVED, chunkEventData);
       } catch (Exception e) {
         Log.e("StreamingDataSource", "Error processing chunk: " + e.getMessage());
       }
+    }
+    
+    private byte[] decryptChunk(byte[] encryptedData, long currentOffset) {
+      try {
+        // Calculate counter for this chunk based on offset
+        byte[] counter = incrementCounter(counterBase, currentOffset);
+        
+        // Create IV parameter spec for AES-CTR
+        IvParameterSpec ivSpec = new IvParameterSpec(counter);
+        
+        // Initialize cipher
+        Cipher cipher = Cipher.getInstance("AES/CTR/NoPadding");
+        cipher.init(Cipher.DECRYPT_MODE, dekKey, ivSpec);
+        
+        // Decrypt the chunk
+        return cipher.doFinal(encryptedData);
+      } catch (Exception e) {
+        Log.e("StreamingDataSource", "Decryption failed: " + e.getMessage());
+        return encryptedData; // Return original data if decryption fails
+      }
+    }
+    
+    private byte[] incrementCounter(byte[] counter, long offset) {
+      byte[] newCounter = new byte[counter.length];
+      System.arraycopy(counter, 0, newCounter, 0, counter.length);
+      
+      // Calculate number of 16-byte blocks (AES block size)
+      long blocks = offset / 16;
+      
+      // Add blocks to counter (big-endian)
+      long carry = blocks;
+      for (int i = newCounter.length - 1; i >= 0 && carry > 0; i--) {
+        long sum = (newCounter[i] & 0xff) + (carry & 0xff);
+        newCounter[i] = (byte) (sum & 0xff);
+        carry = (carry >>> 8) + (sum >>> 8);
+      }
+      
+      return newCounter;
+    }
+    
+    private byte[] hexToByteArray(String hex) {
+      int len = hex.length();
+      byte[] data = new byte[len / 2];
+      for (int i = 0; i < len; i += 2) {
+        data[i / 2] = (byte) ((Character.digit(hex.charAt(i), 16) << 4)
+                             + Character.digit(hex.charAt(i+1), 16));
+      }
+      return data;
     }
 
     // Factory class for creating StreamingDataSource instances
     public static class Factory implements DataSource.Factory {
       private final String url;
       private final ReactApplicationContext reactContext;
+      private final String dekHex;
+      private final String counterBaseHex;
 
       public Factory(String url, ReactApplicationContext reactContext) {
         this.url = url;
         this.reactContext = reactContext;
+        this.dekHex = null;
+        this.counterBaseHex = null;
+      }
+      
+      public Factory(String url, ReactApplicationContext reactContext, String dekHex, String counterBaseHex) {
+        this.url = url;
+        this.reactContext = reactContext;
+        this.dekHex = dekHex;
+        this.counterBaseHex = counterBaseHex;
       }
 
       @Override
       public DataSource createDataSource() {
+        if (dekHex != null && counterBaseHex != null) {
+          return new StreamingDataSource(url, reactContext, dekHex, counterBaseHex);
+        }
         return new StreamingDataSource(url, reactContext);
       }
     }

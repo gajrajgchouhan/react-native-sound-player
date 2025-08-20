@@ -44,6 +44,14 @@ export default {
     RNSoundPlayer.loadUrlWithStreaming(url);
   },
 
+  playUrlWithStreamingEncrypted: (url, dekHex, counterBaseHex) => {
+    RNSoundPlayer.playUrlWithStreamingEncrypted(url, dekHex, counterBaseHex);
+  },
+
+  loadUrlWithStreamingEncrypted: (url, dekHex, counterBaseHex) => {
+    RNSoundPlayer.loadUrlWithStreamingEncrypted(url, dekHex, counterBaseHex);
+  },
+
   playAsset: async (asset) => {
     if (!__DEV__ && Platform.OS === "android") {
       RNSoundPlayer.playSoundFile(resolveAsset(asset).uri, "");

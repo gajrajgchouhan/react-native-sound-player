@@ -17,6 +17,9 @@ declare module "react-native-sound-player" {
     chunkSize?: number;
     position?: number;
     data?: string;
+    encrypted?: boolean;
+    isLoading?: boolean;
+    duration?: number;
   };
 
   interface SoundPlayerType {
@@ -27,6 +30,16 @@ declare module "react-native-sound-player" {
     loadUrl: (url: string) => void;
     playUrlWithStreaming: (url: string) => void;
     loadUrlWithStreaming: (url: string) => void;
+    playUrlWithStreamingEncrypted: (
+      url: string,
+      dekHex: string,
+      counterBaseHex: string
+    ) => void;
+    loadUrlWithStreamingEncrypted: (
+      url: string,
+      dekHex: string,
+      counterBaseHex: string
+    ) => void;
     playAsset: (asset: number) => void;
     loadAsset: (asset: number) => void;
     /** @deprecated  please use addEventListener*/
