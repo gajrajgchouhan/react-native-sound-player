@@ -637,7 +637,9 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
         chunkEventData.putDouble("position", position);
         chunkEventData.putBoolean("encrypted", decryptionEnabled);
         
-        sendEvent(getReactApplicationContext(), EVENT_CHUNK_RECEIVED, chunkEventData);
+         reactContext
+          .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
+          .emit(EVENT_CHUNK_RECEIVED, chunkEventData);
       } catch (Exception e) {
         Log.e("StreamingDataSource", "Error processing chunk: " + e.getMessage());
       }
