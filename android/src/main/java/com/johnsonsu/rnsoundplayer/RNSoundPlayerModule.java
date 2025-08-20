@@ -371,7 +371,7 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
               .createMediaSource(MediaItem.fromUri(url));
       
       this.exoPlayer.setMediaSource(mediaSource);
-      this.exoPlayer.prepare();
+      this.exoPlayer.prepareAsync();
       
       WritableMap params = Arguments.createMap();
       params.putBoolean("success", true);
@@ -473,6 +473,15 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
   }
 
   // Custom DataSource for chunk processing with ExoPlayer
+  // 
+  // Key Features (based on Medium article best practices):
+  // 1. AES-CTR block alignment for encrypted seeking
+  // 2. Separate buffers for encrypted/decrypted data
+  // 3. Precise HTTP Range requests
+  // 4. Proper return value handling (decrypted bytes vs network bytes)
+  // 5. Enhanced error handling and logging
+  //
+  // Data Flow: HTTP Stream → encryptedBuffer → decrypt → decryptedBuffer → ExoPlayer buffer
   private static class StreamingDataSource implements DataSource {
     private final String url;
     private final ReactApplicationContext reactContext;
@@ -491,7 +500,10 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
     // Reusable objects to prevent memory allocations
     private Cipher cipher;
     private byte[] reusableCounter;
+    private byte[] encryptedBuffer;  // Separate buffer for encrypted data
+    private byte[] decryptedBuffer;  // Separate buffer for decrypted data
     private static final int MAX_CHUNK_SIZE = 64 * 1024; // 64KB max chunk size
+    private static final int AES_BLOCK_SIZE = 16; // AES block size for alignment
 
     public StreamingDataSource(String url, ReactApplicationContext reactContext) {
       this.url = url;
@@ -512,6 +524,10 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
           // Initialize cipher once
           this.cipher = Cipher.getInstance("AES/CTR/NoPadding");
           
+          // Initialize separate buffers for encrypted and decrypted data
+          this.encryptedBuffer = new byte[MAX_CHUNK_SIZE];
+          this.decryptedBuffer = new byte[MAX_CHUNK_SIZE];
+          
           this.decryptionEnabled = true;
           Log.d("StreamingDataSource", "Decryption enabled with AES-CTR, max chunk size: " + MAX_CHUNK_SIZE);
         } catch (Exception e) {
@@ -528,40 +544,61 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
 
     @Override
     public long open(DataSpec dataSpec) throws HttpDataSource.HttpDataSourceException {
-      this.dataSpec = dataSpec;
+      // CRITICAL: Align position to AES block boundary for encrypted streams
+      DataSpec alignedDataSpec = dataSpec;
+      if (decryptionEnabled) {
+        alignedDataSpec = alignDataSpecToBlockBoundary(dataSpec);
+        Log.d("StreamingDataSource", String.format("Block alignment: original pos=%d, aligned pos=%d", 
+               dataSpec.position, alignedDataSpec.position));
+      }
+      
+      this.dataSpec = alignedDataSpec;
       this.opened = true;
       this.totalBytesRead = 0; // Reset counter for new stream
 
       try {
         connection = createConnection();
         
-        // Handle range requests for seeking
-        if (dataSpec.position != 0) {
-          connection.setRequestProperty("Range", "bytes=" + dataSpec.position + "-");
+        // Handle range requests for seeking with improved precision
+        if (alignedDataSpec.position != 0) {
+          String rangeHeader = buildRangeRequestHeader(alignedDataSpec.position, alignedDataSpec.length);
+          connection.setRequestProperty("Range", rangeHeader);
+          Log.d("StreamingDataSource", "Range request: " + rangeHeader);
         }
         
         connection.connect();
         
         int responseCode = connection.getResponseCode();
         if (responseCode < 200 || responseCode > 299) {
+          String errorMessage = String.format("HTTP error: %d %s for URL: %s", 
+                  responseCode, connection.getResponseMessage(), url);
+          Log.e("StreamingDataSource", errorMessage);
           throw new HttpDataSource.HttpDataSourceException(
-            "Response code: " + responseCode, 
-            dataSpec, 
+            errorMessage, 
+            alignedDataSpec, 
             HttpDataSource.HttpDataSourceException.TYPE_OPEN
           );
         }
         
+        // Log successful response
+        Log.d("StreamingDataSource", String.format("HTTP %d: %s", responseCode, connection.getResponseMessage()));
+        
         inputStream = connection.getInputStream();
         
         long contentLength = connection.getContentLength();
-        bytesRemaining = dataSpec.length != C.LENGTH_UNSET ? dataSpec.length : contentLength;
+        bytesRemaining = alignedDataSpec.length != C.LENGTH_UNSET ? alignedDataSpec.length : contentLength;
+        
+        // Log connection details for debugging
+        Log.d("StreamingDataSource", String.format("Connected: %s, Content-Length: %d, Bytes remaining: %d", 
+               url, contentLength, bytesRemaining));
         
         return bytesRemaining;
       } catch (IOException e) {
+        Log.e("StreamingDataSource", "Connection failed for URL: " + url, e);
         throw new HttpDataSource.HttpDataSourceException(
-          "Unable to connect", 
+          "Unable to connect to: " + url, 
           e, 
-          dataSpec, 
+          alignedDataSpec, 
           HttpDataSource.HttpDataSourceException.TYPE_OPEN
         );
       }
@@ -587,24 +624,49 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
           bytesToRead = Math.min(bytesToRead, MAX_CHUNK_SIZE);
         }
         
-        int bytesRead = inputStream.read(buffer, offset, bytesToRead);
-        
-        if (bytesRead > 0) {
-          if (bytesRemaining != C.LENGTH_UNSET) {
-            bytesRemaining -= bytesRead;
+        if (decryptionEnabled) {
+          // Read encrypted data from network into our encrypted buffer
+          int encryptedBytesRead = inputStream.read(encryptedBuffer, 0, bytesToRead);
+          
+          if (encryptedBytesRead > 0) {
+            if (bytesRemaining != C.LENGTH_UNSET) {
+              bytesRemaining -= encryptedBytesRead;
+            }
+            
+            // Decrypt from encrypted buffer to decrypted buffer
+            // Use the aligned position from dataSpec for counter calculation
+            long actualStreamPosition = dataSpec.position + totalBytesRead;
+            int decryptedBytes = decryptChunkToSeparateBuffer(encryptedBytesRead, actualStreamPosition);
+            
+            // Copy decrypted data to ExoPlayer's buffer
+            System.arraycopy(decryptedBuffer, 0, buffer, offset, decryptedBytes);
+            
+            // Send chunk event with network bytes read (for progress tracking)
+            sendChunkEvent(encryptedBytesRead, dataSpec.position + totalBytesRead);
+            totalBytesRead += encryptedBytesRead;
+            
+            // CRITICAL FIX: Return decrypted bytes given to ExoPlayer, not network bytes
+            return decryptedBytes;
           }
           
-          // Process chunk here - decrypt in-place to avoid extra allocations
-          if (decryptionEnabled) {
-            decryptChunkInPlace(buffer, offset, bytesRead, dataSpec.position + totalBytesRead);
+          // Return -1 for EOF or error
+          return encryptedBytesRead;
+        } else {
+          // For non-encrypted data, read directly to ExoPlayer's buffer
+          int bytesRead = inputStream.read(buffer, offset, bytesToRead);
+          
+          if (bytesRead > 0) {
+            if (bytesRemaining != C.LENGTH_UNSET) {
+              bytesRemaining -= bytesRead;
+            }
+            
+            // Send chunk event with minimal data
+            sendChunkEvent(bytesRead, dataSpec.position + totalBytesRead);
+            totalBytesRead += bytesRead;
           }
           
-          // Send chunk event with minimal data
-          sendChunkEvent(bytesRead, dataSpec.position + totalBytesRead);
-          totalBytesRead += bytesRead;
+          return bytesRead;
         }
-        
-        return bytesRead;
       } catch (IOException e) {
         throw new HttpDataSource.HttpDataSourceException(
           "Read error", 
@@ -636,6 +698,12 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
         if (reusableCounter != null) {
           java.util.Arrays.fill(reusableCounter, (byte) 0);
         }
+        if (encryptedBuffer != null) {
+          java.util.Arrays.fill(encryptedBuffer, (byte) 0);
+        }
+        if (decryptedBuffer != null) {
+          java.util.Arrays.fill(decryptedBuffer, (byte) 0);
+        }
         
         opened = false;
       } catch (IOException e) {
@@ -658,11 +726,40 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
       return conn;
     }
 
-    // Optimized method that decrypts data in-place to avoid memory allocations
-    private void decryptChunkInPlace(byte[] buffer, int offset, int length, long currentOffset) {
+    // CRITICAL: Align DataSpec position to AES block boundary for encrypted streams
+    private DataSpec alignDataSpecToBlockBoundary(DataSpec dataSpec) {
+      long alignedPosition = (dataSpec.position / AES_BLOCK_SIZE) * AES_BLOCK_SIZE;
+      
+      // If we had to align backwards, we need to adjust the length accordingly
+      long positionDiff = dataSpec.position - alignedPosition;
+      long adjustedLength = dataSpec.length;
+      
+      if (dataSpec.length != C.LENGTH_UNSET && positionDiff > 0) {
+        adjustedLength = dataSpec.length + positionDiff;
+      }
+      
+      return dataSpec.buildUpon()
+              .setPosition(alignedPosition)
+              .setLength(adjustedLength)
+              .build();
+    }
+
+    // Build precise HTTP Range header
+    private String buildRangeRequestHeader(long position, long length) {
+      if (length != C.LENGTH_UNSET) {
+        return "bytes=" + position + "-" + (position + length - 1);
+      } else {
+        return "bytes=" + position + "-";
+      }
+    }
+
+    // Optimized method that decrypts from encrypted buffer to decrypted buffer
+    private int decryptChunkToSeparateBuffer(int length, long currentOffset) {
       try {
         if (!decryptionEnabled || cipher == null || dekKey == null || counterBase == null) {
-          return;
+          // If decryption is not enabled, copy encrypted data to decrypted buffer
+          System.arraycopy(encryptedBuffer, 0, decryptedBuffer, 0, length);
+          return length;
         }
         
         // Calculate counter for this chunk based on offset - reuse array
@@ -674,22 +771,20 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
         // Reinitialize cipher with new IV
         cipher.init(Cipher.DECRYPT_MODE, dekKey, ivSpec);
         
-        // Decrypt in-place to avoid additional memory allocation
-        // Create temporary array only for the chunk being decrypted
-        byte[] chunkData = new byte[length];
-        System.arraycopy(buffer, offset, chunkData, 0, length);
-        
-        byte[] decryptedData = cipher.doFinal(chunkData);
+        // Decrypt from encrypted buffer directly to decrypted buffer
+        int decryptedBytes = cipher.doFinal(encryptedBuffer, 0, length, decryptedBuffer, 0);
 
-        // log the decrypted data in form of string
-        Log.d("StreamingDataSource", "Decrypted data: " + new String(decryptedData));
+        // Log decryption success with position info for debugging
+        Log.d("StreamingDataSource", String.format("Decrypted %d bytes at position %d (blocks: %d)", 
+              decryptedBytes, currentOffset, currentOffset / AES_BLOCK_SIZE));
 
-        // Copy decrypted data back to buffer
-        System.arraycopy(decryptedData, 0, buffer, offset, Math.min(decryptedData.length, length));
+        return decryptedBytes;
         
       } catch (Exception e) {
         Log.e("StreamingDataSource", "Decryption failed: " + e.getMessage());
-        // Continue with encrypted data if decryption fails
+        // Fallback: copy encrypted data to decrypted buffer if decryption fails
+        System.arraycopy(encryptedBuffer, 0, decryptedBuffer, 0, length);
+        return length;
       }
     }
     
