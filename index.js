@@ -44,12 +44,36 @@ export default {
     RNSoundPlayer.loadUrlWithStreaming(url);
   },
 
-  playUrlWithStreamingEncrypted: (url, dekHex, counterBaseHex) => {
-    RNSoundPlayer.playUrlWithStreamingEncrypted(url, dekHex, counterBaseHex);
+  playUrlWithStreamingEncrypted: (
+    url,
+    dekHex,
+    counterBaseHex,
+    bitrate,
+    duration
+  ) => {
+    RNSoundPlayer.playUrlWithStreamingEncrypted(
+      url,
+      dekHex,
+      counterBaseHex,
+      bitrate,
+      duration
+    );
   },
 
-  loadUrlWithStreamingEncrypted: (url, dekHex, counterBaseHex) => {
-    RNSoundPlayer.loadUrlWithStreamingEncrypted(url, dekHex, counterBaseHex);
+  loadUrlWithStreamingEncrypted: (
+    url,
+    dekHex,
+    counterBaseHex,
+    bitrate,
+    duration
+  ) => {
+    RNSoundPlayer.loadUrlWithStreamingEncrypted(
+      url,
+      dekHex,
+      counterBaseHex,
+      bitrate,
+      duration
+    );
   },
 
   playAsset: async (asset) => {
