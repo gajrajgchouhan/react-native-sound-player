@@ -45,6 +45,13 @@ import javax.crypto.spec.SecretKeySpec;
 import javax.crypto.spec.IvParameterSpec;
 import java.security.Security;
 import java.util.Arrays;
+import java.math.BigInteger;
+
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
+import org.bouncycastle.crypto.engines.AESEngine;
+import org.bouncycastle.crypto.modes.SICBlockCipher;
+import org.bouncycastle.crypto.params.KeyParameter;
+import org.bouncycastle.crypto.params.ParametersWithIV;
 
 import com.google.android.exoplayer2.PlaybackException;
 import com.google.android.exoplayer2.audio.AudioAttributes;
@@ -494,7 +501,7 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
     private DataSpec dataSpec;
     
     // Decryption fields
-    private SecretKeySpec dekKey;
+    private byte[] dekKey;
     private byte[] counterBase;
     private boolean decryptionEnabled = false;
     private long totalBytesRead = 0;
@@ -505,9 +512,8 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
     private boolean headersReady = false;
     private int headerBytesConsumed = 0; // Track how much of header buffer we've given to ExoPlayer
     
-    // Reusable objects to prevent memory allocations
-    private Cipher cipher;
-    private byte[] reusableCounter;
+    // Bouncy Castle CTR cipher
+    private SICBlockCipher ctrCipher;
     private byte[] encryptedBuffer;  // Separate buffer for encrypted data
     private byte[] decryptedBuffer;  // Separate buffer for decrypted data
     private static final int MAX_CHUNK_SIZE = 64 * 1024; // 64KB max chunk size
@@ -524,20 +530,23 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
       
       if (dekHex != null && !dekHex.isEmpty() && counterBaseHex != null && !counterBaseHex.isEmpty()) {
         try {
-          byte[] dekBytes = hexToByteArray(dekHex);
-          this.dekKey = new SecretKeySpec(dekBytes, "AES");
-          this.counterBase = hexToByteArray(counterBaseHex);
-          this.reusableCounter = new byte[this.counterBase.length]; // Reusable counter array
+          // Add Bouncy Castle provider if not already added
+          if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
+            Security.addProvider(new BouncyCastleProvider());
+          }
           
-          // Initialize cipher once
-          this.cipher = Cipher.getInstance("AES/CTR/NoPadding");
+          this.dekKey = hexToByteArray(dekHex);
+          this.counterBase = hexToByteArray(counterBaseHex);
+          
+          // Initialize Bouncy Castle CTR cipher
+          this.ctrCipher = new SICBlockCipher(new AESEngine());
           
           // Initialize separate buffers for encrypted and decrypted data
           this.encryptedBuffer = new byte[MAX_CHUNK_SIZE];
           this.decryptedBuffer = new byte[MAX_CHUNK_SIZE];
           
           this.decryptionEnabled = true;
-          Log.d("StreamingDataSource", "Decryption enabled with AES-CTR, max chunk size: " + MAX_CHUNK_SIZE);
+          Log.d("StreamingDataSource", "Decryption enabled with Bouncy Castle AES-CTR, max chunk size: " + MAX_CHUNK_SIZE);
         } catch (Exception e) {
           Log.e("StreamingDataSource", "Failed to initialize decryption: " + e.getMessage());
           this.decryptionEnabled = false;
@@ -801,14 +810,16 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
         }
         
         // Clear sensitive data
-        if (reusableCounter != null) {
-          java.util.Arrays.fill(reusableCounter, (byte) 0);
-        }
         if (encryptedBuffer != null) {
           java.util.Arrays.fill(encryptedBuffer, (byte) 0);
         }
         if (decryptedBuffer != null) {
           java.util.Arrays.fill(decryptedBuffer, (byte) 0);
+        }
+        
+        // Reset Bouncy Castle cipher
+        if (ctrCipher != null) {
+          ctrCipher.reset();
         }
         
         // Clear header buffer
@@ -866,138 +877,90 @@ public class RNSoundPlayerModule extends ReactContextBaseJavaModule implements L
       }
     }
 
-    // Optimized method that decrypts from encrypted buffer to decrypted buffer
-private int decryptChunkToSeparateBuffer(int length, long currentOffset) {
-  try {
-    Log.d("StreamingDataSource", String.format("=== DECRYPT CHUNK START ==="));
-    Log.d("StreamingDataSource", String.format("Input params: length=%d, currentOffset=%d", length, currentOffset));
-    Log.d("StreamingDataSource", String.format("Decryption enabled: %b", decryptionEnabled));
-    
-    if (!decryptionEnabled || cipher == null || dekKey == null || counterBase == null) {
-      Log.w("StreamingDataSource", "Decryption disabled or missing components - copying raw data");
-      Log.d("StreamingDataSource", String.format("cipher null: %b, dekKey null: %b, counterBase null: %b", 
-            cipher == null, dekKey == null, counterBase == null));
-      // If decryption is not enabled, copy encrypted data to decrypted buffer
-      System.arraycopy(encryptedBuffer, 0, decryptedBuffer, 0, length);
-      return length;
-    }
-    
-    // Log input encrypted data
-    StringBuilder encryptedHex = new StringBuilder();
-    StringBuilder encryptedDec = new StringBuilder();
-    for (int i = 0; i < Math.min(length, 20); i++) {
-      encryptedHex.append(String.format("%02X ", encryptedBuffer[i] & 0xFF));
-      encryptedDec.append(String.format("%d, ", encryptedBuffer[i]));
-    }
-    Log.d("StreamingDataSource", String.format("Encrypted input (first %d bytes hex): %s", 
-          Math.min(length, 20), encryptedHex.toString()));
-    Log.d("StreamingDataSource", String.format("Encrypted input (first %d bytes dec): %s", 
-          Math.min(length, 20), encryptedDec.toString()));
-    
-    // Log counter base before update
-    StringBuilder counterBaseHex = new StringBuilder();
-    for (int i = 0; i < counterBase.length; i++) {
-      counterBaseHex.append(String.format("%02X ", counterBase[i] & 0xFF));
-    }
-    Log.d("StreamingDataSource", String.format("Counter base: %s", counterBaseHex.toString()));
-    
-    // Calculate counter for this chunk based on offset - reuse array
-    updateCounter(reusableCounter, counterBase, currentOffset);
-    
-    // Log the calculated counter/IV
-    StringBuilder counterHex = new StringBuilder();
-    StringBuilder counterDec = new StringBuilder();
-    for (int i = 0; i < reusableCounter.length; i++) {
-      counterHex.append(String.format("%02X ", reusableCounter[i] & 0xFF));
-      counterDec.append(String.format("%d, ", reusableCounter[i]));
-    }
-    Log.d("StreamingDataSource", String.format("Calculated IV/Counter (hex): %s", counterHex.toString()));
-    Log.d("StreamingDataSource", String.format("Calculated IV/Counter (dec): %s", counterDec.toString()));
-    
-    // Log DEK key info (first few bytes only for security)
-    if (dekKey != null && dekKey.getEncoded() != null) {
-      byte[] keyBytes = dekKey.getEncoded();
-      StringBuilder keyHex = new StringBuilder();
-      for (int i = 0; i < Math.min(8, keyBytes.length); i++) {
-        keyHex.append(String.format("%02X ", keyBytes[i] & 0xFF));
+    // Enhanced Bouncy Castle CTR decryption with 64-bit nonce
+    private int decryptChunkToSeparateBuffer(int length, long currentOffset) {
+      try {
+        Log.d("StreamingDataSource", String.format("Decrypting %d bytes at offset %d", length, currentOffset));
+        
+        if (!decryptionEnabled || ctrCipher == null || dekKey == null || counterBase == null) {
+          Log.w("StreamingDataSource", "Decryption disabled or missing components - copying raw data");
+          System.arraycopy(encryptedBuffer, 0, decryptedBuffer, 0, length);
+          return length;
+        }
+        
+        // Verify counter base is 16 bytes (128-bit IV)
+        if (counterBase.length != 16) {
+          Log.e("StreamingDataSource", "Invalid counter base length: " + counterBase.length + " (expected 16)");
+          System.arraycopy(encryptedBuffer, 0, decryptedBuffer, 0, length);
+          return length;
+        }
+        
+        // Calculate the block position for CTR mode
+        long blockPosition = currentOffset / AES_BLOCK_SIZE;
+        
+        // Create the IV: 64-bit nonce + 64-bit counter
+        byte[] iv = new byte[16];
+        
+        // Copy first 8 bytes as fixed nonce (unchanged throughout stream)
+        System.arraycopy(counterBase, 0, iv, 0, 8);
+        
+        // Extract the base counter value from last 8 bytes of counterBase
+        byte[] baseCounterBytes = new byte[8];
+        System.arraycopy(counterBase, 8, baseCounterBytes, 0, 8);
+        
+        // Convert base counter to long, add block position, convert back to bytes
+        long baseCounter = 0;
+        for (int i = 0; i < 8; i++) {
+          baseCounter = (baseCounter << 8) | (baseCounterBytes[i] & 0xFF);
+        }
+        
+        long currentCounter = baseCounter + blockPosition;
+        
+        // Convert counter back to bytes (big-endian, last 8 bytes of IV)
+        for (int i = 7; i >= 0; i--) {
+          iv[8 + i] = (byte) (currentCounter & 0xFF);
+          currentCounter >>>= 8;
+        }
+        
+        // Log nonce and counter for debugging
+        if (blockPosition == 0) {
+          Log.d("StreamingDataSource", String.format("64-bit nonce: %s", 
+                bytesToHex(iv, 0, 8)));
+          Log.d("StreamingDataSource", String.format("Base counter: %s", 
+                bytesToHex(counterBase, 8, 8)));
+        }
+        Log.d("StreamingDataSource", String.format("Block %d counter: %s", 
+              blockPosition, bytesToHex(iv, 8, 8)));
+        
+        // Initialize cipher with key and IV
+        KeyParameter keyParam = new KeyParameter(dekKey);
+        ParametersWithIV params = new ParametersWithIV(keyParam, iv);
+        ctrCipher.init(false, params); // false = decrypt mode
+        
+        // Decrypt the data
+        int decryptedBytes = ctrCipher.processBytes(encryptedBuffer, 0, length, decryptedBuffer, 0);
+        
+        Log.d("StreamingDataSource", String.format("✓ Decrypted %d bytes successfully (64-bit nonce CTR)", decryptedBytes));
+        return decryptedBytes;
+        
+      } catch (Exception e) {
+        Log.e("StreamingDataSource", "Bouncy Castle decryption failed: " + e.getMessage());
+        e.printStackTrace();
+        
+        // Fallback: copy encrypted data as-is
+        System.arraycopy(encryptedBuffer, 0, decryptedBuffer, 0, length);
+        return length;
       }
-      Log.d("StreamingDataSource", String.format("DEK Key (first 8 bytes): %s... (algorithm: %s, format: %s)", 
-            keyHex.toString(), dekKey.getAlgorithm(), dekKey.getFormat()));
     }
     
-    // Create IV parameter spec for AES-CTR
-    IvParameterSpec ivSpec = new IvParameterSpec(reusableCounter);
-    
-    // Log cipher info before init
-    Log.d("StreamingDataSource", String.format("Cipher algorithm: %s", cipher.getAlgorithm()));
-    Log.d("StreamingDataSource", String.format("Block size: %d, AES_BLOCK_SIZE constant: %d", 
-          cipher.getBlockSize(), AES_BLOCK_SIZE));
-    
-    // Reinitialize cipher with new IV
-    cipher.init(Cipher.DECRYPT_MODE, dekKey, ivSpec);
-    Log.d("StreamingDataSource", "Cipher reinitialized successfully");
-
-    StringBuilder encryptedInputHex = new StringBuilder();
-StringBuilder encryptedInputDec = new StringBuilder();
-for (int i = 0; i < Math.min(length, 16); i++) {
-  encryptedInputHex.append(String.format("%02X ", encryptedBuffer[i] & 0xFF));
-  encryptedInputDec.append(String.format("%d, ", encryptedBuffer[i]));
-}
-Log.d("StreamingDataSource", String.format("ENCRYPTED INPUT (hex): %s", encryptedInputHex.toString()));
-Log.d("StreamingDataSource", String.format("ENCRYPTED INPUT (dec): %s", encryptedInputDec.toString()));
-    
-    // Decrypt from encrypted buffer directly to decrypted buffer
-    int decryptedBytes = cipher.doFinal(encryptedBuffer, 0, length, decryptedBuffer, 0);
-    
-    // Log output decrypted data
-    StringBuilder decryptedHex = new StringBuilder();
-    StringBuilder decryptedDec = new StringBuilder();
-    for (int i = 0; i < Math.min(decryptedBytes, 20); i++) {
-      decryptedHex.append(String.format("%02X ", decryptedBuffer[i] & 0xFF));
-      decryptedDec.append(String.format("%d, ", decryptedBuffer[i]));
+    // Helper method to convert bytes to hex string for debugging
+    private String bytesToHex(byte[] bytes, int offset, int length) {
+      StringBuilder result = new StringBuilder();
+      for (int i = offset; i < offset + length && i < bytes.length; i++) {
+        result.append(String.format("%02X", bytes[i] & 0xFF));
+      }
+      return result.toString();
     }
-    Log.d("StreamingDataSource", String.format("Decrypted output (first %d bytes hex): %s", 
-          Math.min(decryptedBytes, 20), decryptedHex.toString()));
-    Log.d("StreamingDataSource", String.format("Decrypted output (first %d bytes dec): %s", 
-          Math.min(decryptedBytes, 20), decryptedDec.toString()));
-
-    // Log decryption success with position info for debugging
-    Log.d("StreamingDataSource", String.format("✓ Decrypted %d bytes at offset %d (block: %d)", 
-          decryptedBytes, currentOffset, currentOffset / AES_BLOCK_SIZE));
-    Log.d("StreamingDataSource", String.format("=== DECRYPT CHUNK END ==="));
-
-    return decryptedBytes;
-    
-  } catch (Exception e) {
-    Log.e("StreamingDataSource", "Decryption failed: " + e.getMessage());
-    Log.e("StreamingDataSource", "Exception type: " + e.getClass().getSimpleName());
-    e.printStackTrace();
-    
-    // Log fallback action
-    Log.w("StreamingDataSource", "Falling back to copying encrypted data as-is");
-    System.arraycopy(encryptedBuffer, 0, decryptedBuffer, 0, length);
-    return length;
-  }
-}
-
-private void updateCounter(byte[] targetCounter, byte[] baseCounter, long offset) {
-    System.arraycopy(baseCounter, 0, targetCounter, 0, baseCounter.length);
-    
-    // Use BigInteger for safe arithmetic (Android equivalent of BigInt)
-    BigInteger counter = new BigInteger(1, baseCounter);
-    BigInteger blockOffset = BigInteger.valueOf(offset / 16);
-    BigInteger result = counter.add(blockOffset);
-    
-    byte[] resultBytes = result.toByteArray();
-    
-    // Handle potential leading zero byte from BigInteger
-    int srcPos = resultBytes.length > baseCounter.length ? 1 : 0;
-    int copyLen = Math.min(resultBytes.length - srcPos, baseCounter.length);
-    int destPos = baseCounter.length - copyLen;
-    
-    Arrays.fill(targetCounter, (byte) 0);
-    System.arraycopy(resultBytes, srcPos, targetCounter, destPos, copyLen);
-}
     
     // Lightweight method to send chunk events
     private void sendChunkEvent(int length, long position) {
