@@ -6,6 +6,7 @@
 
 #import "RNSoundPlayer.h"
 #import <AVFoundation/AVFoundation.h>
+#import <CommonCrypto/CommonCryptor.h>
 
 @implementation RNSoundPlayer
 {
@@ -31,6 +32,14 @@ RCT_EXPORT_MODULE();
     self = [super init];
     if (self) {
         self.loopCount = 0;
+        
+        // Initialize encryption properties
+        self.encryptionEnabled = NO;
+        self.useCustomDurationAndBitrate = NO;
+        self.encryptedBitrate = 0;
+        self.encryptedDuration = 0.0f;
+        self.totalBytesProcessed = 0;
+        
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(itemDidFinishPlaying:)
                                                      name:AVPlayerItemDidPlayToEndTimeNotification
@@ -45,6 +54,11 @@ RCT_EXPORT_MODULE();
         [self.streamingSession invalidateAndCancel];
         self.streamingSession = nil;
     }
+    
+    // Clean up encryption properties
+    self.dekKey = nil;
+    self.counterBase = nil;
+    self.encryptionEnabled = NO;
 }
 
 - (NSArray<NSString *> *)supportedEvents {
@@ -79,6 +93,17 @@ RCT_EXPORT_METHOD(playUrlWithStreaming:(NSString *)url) {
 
 RCT_EXPORT_METHOD(loadUrlWithStreaming:(NSString *)url) {
     [self prepareUrlWithStreaming:url];
+}
+
+RCT_EXPORT_METHOD(playUrlWithStreamingEncrypted:(NSString *)url dekHex:(NSString *)dekHex counterBaseHex:(NSString *)counterBaseHex bitrate:(NSInteger)bitrate duration:(float)duration) {
+    [self prepareUrlWithStreamingEncrypted:url dekHex:dekHex counterBaseHex:counterBaseHex bitrate:bitrate duration:duration];
+    if (self.avPlayer) {
+        [self.avPlayer play];
+    }
+}
+
+RCT_EXPORT_METHOD(loadUrlWithStreamingEncrypted:(NSString *)url dekHex:(NSString *)dekHex counterBaseHex:(NSString *)counterBaseHex bitrate:(NSInteger)bitrate duration:(float)duration) {
+    [self prepareUrlWithStreamingEncrypted:url dekHex:dekHex counterBaseHex:counterBaseHex bitrate:bitrate duration:duration];
 }
 
 RCT_EXPORT_METHOD(playSoundFile:(NSString *)name ofType:(NSString *)type) {
@@ -196,11 +221,20 @@ RCT_REMAP_METHOD(getInfo,
     } else if (self.avPlayer != nil) {
         CMTime currentTime = [[self.avPlayer currentItem] currentTime];
         CMTime duration = [[[self.avPlayer currentItem] asset] duration];
-        NSDictionary *data = @{
-            @"currentTime": [NSNumber numberWithFloat:CMTimeGetSeconds(currentTime)],
-            @"duration": [NSNumber numberWithFloat:CMTimeGetSeconds(duration)]
-        };
-        resolve(data);
+        
+        NSMutableDictionary *data = [[NSMutableDictionary alloc] init];
+        [data setObject:[NSNumber numberWithFloat:CMTimeGetSeconds(currentTime)] forKey:@"currentTime"];
+        
+        // Use custom duration for encrypted streams if available
+        if (self.useCustomDurationAndBitrate && self.encryptedDuration > 0) {
+            [data setObject:[NSNumber numberWithFloat:self.encryptedDuration] forKey:@"duration"];
+            [data setObject:[NSNumber numberWithInteger:self.encryptedBitrate] forKey:@"bitrate"];
+            [data setObject:[NSNumber numberWithBool:YES] forKey:@"customDuration"];
+        } else {
+            [data setObject:[NSNumber numberWithFloat:CMTimeGetSeconds(duration)] forKey:@"duration"];
+        }
+        
+        resolve([data copy]);
     } else {
         resolve(nil);
     }
@@ -264,9 +298,29 @@ RCT_REMAP_METHOD(getInfo,
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary<NSKeyValueChangeKey,id> *)change context:(void *)context {
     if (object == self.avPlayer.currentItem && [keyPath isEqualToString:@"status"] && hasListeners) {
         if (self.avPlayer.currentItem.status == AVPlayerItemStatusReadyToPlay) {
-            [self sendEventWithName:EVENT_FINISHED_LOADING body:@{@"success": [NSNumber numberWithBool:YES]}];
+            NSMutableDictionary *loadingData = [[NSMutableDictionary alloc] init];
+            [loadingData setObject:[NSNumber numberWithBool:YES] forKey:@"success"];
+            
+            if (self.encryptionEnabled) {
+                [loadingData setObject:[NSNumber numberWithBool:YES] forKey:@"encrypted"];
+                [loadingData setObject:[NSNumber numberWithInteger:self.encryptedBitrate] forKey:@"bitrate"];
+                [loadingData setObject:[NSNumber numberWithFloat:self.encryptedDuration] forKey:@"duration"];
+            }
+            
+            [self sendEventWithName:EVENT_FINISHED_LOADING body:[loadingData copy]];
+            
             NSURL *url = [(AVURLAsset *)self.avPlayer.currentItem.asset URL];
-            [self sendEventWithName:EVENT_FINISHED_LOADING_URL body:@{@"success": [NSNumber numberWithBool:YES], @"url": [url absoluteString]}];
+            NSMutableDictionary *urlData = [[NSMutableDictionary alloc] init];
+            [urlData setObject:[NSNumber numberWithBool:YES] forKey:@"success"];
+            [urlData setObject:[url absoluteString] forKey:@"url"];
+            
+            if (self.encryptionEnabled) {
+                [urlData setObject:[NSNumber numberWithBool:YES] forKey:@"encrypted"];
+                [urlData setObject:[NSNumber numberWithInteger:self.encryptedBitrate] forKey:@"bitrate"];
+                [urlData setObject:[NSNumber numberWithFloat:self.encryptedDuration] forKey:@"duration"];
+            }
+            
+            [self sendEventWithName:EVENT_FINISHED_LOADING_URL body:[urlData copy]];
         } else if (self.avPlayer.currentItem.status == AVPlayerItemStatusFailed) {
             [self sendErrorEvent:self.avPlayer.currentItem.error];
         }
@@ -285,6 +339,50 @@ RCT_REMAP_METHOD(getInfo,
     }
     
     // Create a custom URL scheme for streaming
+    NSString *streamingUrl = [url stringByReplacingOccurrencesOfString:@"https://" withString:@"streaming://"];
+    streamingUrl = [streamingUrl stringByReplacingOccurrencesOfString:@"http://" withString:@"streaming://"];
+    NSURL *streamingURL = [NSURL URLWithString:streamingUrl];
+    
+    // Create AVURLAsset with custom scheme
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:streamingURL options:nil];
+    
+    // Set up resource loader delegate for custom streaming
+    [asset.resourceLoader setDelegate:self queue:dispatch_get_main_queue()];
+    
+    // Create player item and player
+    AVPlayerItem *playerItem = [AVPlayerItem playerItemWithAsset:asset];
+    self.avPlayer = [[AVPlayer alloc] initWithPlayerItem:playerItem];
+    
+    // Store original URL for actual loading
+    [self.avPlayer.currentItem addObserver:self forKeyPath:@"status" options:0 context:nil];
+    
+    // Initialize streaming session
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
+    self.streamingSession = [NSURLSession sessionWithConfiguration:config];
+    self.streamingData = [[NSMutableData alloc] init];
+}
+
+- (void)prepareUrlWithStreamingEncrypted:(NSString *)url dekHex:(NSString *)dekHex counterBaseHex:(NSString *)counterBaseHex bitrate:(NSInteger)bitrate duration:(float)duration {
+    if (self.player) {
+        self.player = nil;
+    }
+    
+    // Initialize encryption parameters
+    self.dekKey = [self hexStringToNSData:dekHex];
+    self.counterBase = [self hexStringToNSData:counterBaseHex];
+    self.encryptionEnabled = (self.dekKey && self.counterBase);
+    self.encryptedBitrate = bitrate;
+    self.encryptedDuration = duration;
+    self.useCustomDurationAndBitrate = YES;
+    self.totalBytesProcessed = 0;
+    
+    if (!self.encryptionEnabled) {
+        NSError *error = [NSError errorWithDomain:@"RNSoundPlayerError" code:1001 userInfo:@{NSLocalizedDescriptionKey: @"Invalid encryption parameters"}];
+        [self sendErrorEvent:error];
+        return;
+    }
+    
+    // Create a custom URL scheme for encrypted streaming
     NSString *streamingUrl = [url stringByReplacingOccurrencesOfString:@"https://" withString:@"streaming://"];
     streamingUrl = [streamingUrl stringByReplacingOccurrencesOfString:@"http://" withString:@"streaming://"];
     NSURL *streamingURL = [NSURL URLWithString:streamingUrl];
@@ -372,22 +470,178 @@ RCT_REMAP_METHOD(getInfo,
 }
 
 - (void)processChunk:(NSData *)chunk atPosition:(long long)position {
-    // Your custom chunk processing logic here
-    // For example, you could:
-    // - Decrypt the chunk
-    // - Apply audio effects
-    // - Log streaming progress
-    // - Send chunk data to React Native
+    // Process decryption if encryption is enabled
+    NSData *processedChunk = chunk;
+    if (self.encryptionEnabled && self.dekKey && self.counterBase) {
+        processedChunk = [self decryptChunk:chunk atPosition:position];
+        if (!processedChunk) {
+            processedChunk = chunk; // Fallback to original chunk if decryption fails
+        }
+    }
     
+    // Update total bytes processed
+    self.totalBytesProcessed += processedChunk.length;
+    
+    // Send chunk data to React Native
     if (hasListeners) {
-        NSString *base64Data = [chunk base64EncodedStringWithOptions:0];
+        NSString *base64Data = [processedChunk base64EncodedStringWithOptions:0];
         NSDictionary *chunkData = @{
-            @"chunkSize": @(chunk.length),
+            @"chunkSize": @(processedChunk.length),
             @"position": @(position),
-            @"data": base64Data
+            @"data": base64Data,
+            @"encrypted": @(self.encryptionEnabled),
+            @"totalBytesProcessed": @(self.totalBytesProcessed)
         };
         [self sendEventWithName:EVENT_CHUNK_RECEIVED body:chunkData];
     }
+}
+
+// Helper method to convert hex string to NSData
+- (NSData *)hexStringToNSData:(NSString *)hexString {
+    if (!hexString || hexString.length == 0) {
+        return nil;
+    }
+    
+    // Remove any spaces or non-hex characters
+    NSString *cleanHexString = [[hexString componentsSeparatedByCharactersInSet:[[NSCharacterSet characterSetWithCharactersInString:@"0123456789ABCDEFabcdef"] invertedSet]] componentsJoinedByString:@""];
+    
+    // Ensure even length
+    if (cleanHexString.length % 2 != 0) {
+        return nil;
+    }
+    
+    NSMutableData *data = [[NSMutableData alloc] init];
+    for (NSUInteger i = 0; i < cleanHexString.length; i += 2) {
+        NSString *hexByte = [cleanHexString substringWithRange:NSMakeRange(i, 2)];
+        unsigned int byte = 0;
+        [[NSScanner scannerWithString:hexByte] scanHexInt:&byte];
+        uint8_t byteValue = byte;
+        [data appendBytes:&byteValue length:1];
+    }
+    
+    return [data copy];
+}
+
+// AES CTR decryption method
+- (NSData *)decryptChunk:(NSData *)encryptedData atPosition:(long long)position {
+    if (!self.encryptionEnabled || !self.dekKey || !self.counterBase || !encryptedData) {
+        return nil;
+    }
+    
+    // Verify key and counter base lengths
+    if (self.dekKey.length != kCCKeySizeAES256 && self.dekKey.length != kCCKeySizeAES192 && self.dekKey.length != kCCKeySizeAES128) {
+        NSLog(@"[RNSoundPlayer] Invalid key size: %lu", (unsigned long)self.dekKey.length);
+        return nil;
+    }
+    
+    if (self.counterBase.length != kCCBlockSizeAES128) {
+        NSLog(@"[RNSoundPlayer] Invalid counter base size: %lu", (unsigned long)self.counterBase.length);
+        return nil;
+    }
+    
+    // Calculate block position for CTR mode
+    long long blockPosition = position / kCCBlockSizeAES128;
+    
+    // Create IV: 64-bit nonce + 64-bit counter (following Android implementation)
+    uint8_t iv[kCCBlockSizeAES128];
+    const uint8_t *counterBaseBytes = (const uint8_t *)[self.counterBase bytes];
+    
+    // Copy first 8 bytes as fixed nonce
+    memcpy(iv, counterBaseBytes, 8);
+    
+    // Extract base counter from last 8 bytes of counterBase
+    uint64_t baseCounter = 0;
+    for (int i = 0; i < 8; i++) {
+        baseCounter = (baseCounter << 8) | counterBaseBytes[8 + i];
+    }
+    
+    // Calculate current counter
+    uint64_t currentCounter = baseCounter + blockPosition;
+    
+    // Convert counter back to bytes (big-endian, last 8 bytes of IV)
+    for (int i = 7; i >= 0; i--) {
+        iv[8 + i] = (uint8_t)(currentCounter & 0xFF);
+        currentCounter >>= 8;
+    }
+    
+    // Perform AES CTR decryption
+    NSMutableData *decryptedData = [NSMutableData dataWithLength:encryptedData.length];
+    size_t decryptedLength = 0;
+    
+    CCCryptorStatus status = CCCrypt(
+        kCCDecrypt,
+        kCCAlgorithmAES,
+        kCCOptionECBMode, // We'll handle CTR mode manually
+        [self.dekKey bytes],
+        self.dekKey.length,
+        nil, // No IV for ECB mode, we'll XOR manually
+        [encryptedData bytes],
+        encryptedData.length,
+        [decryptedData mutableBytes],
+        decryptedData.length,
+        &decryptedLength
+    );
+    
+    if (status != kCCSuccess) {
+        NSLog(@"[RNSoundPlayer] Decryption failed with status: %d", status);
+        return nil;
+    }
+    
+    // For proper CTR mode, we need to encrypt the counter and XOR with data
+    // Since CommonCrypto doesn't have direct CTR support, we'll implement it manually
+    NSMutableData *keystream = [NSMutableData dataWithLength:encryptedData.length];
+    NSMutableData *currentIV = [NSMutableData dataWithBytes:iv length:kCCBlockSizeAES128];
+    
+    // Generate keystream by encrypting consecutive counter values
+    for (NSUInteger offset = 0; offset < encryptedData.length; offset += kCCBlockSizeAES128) {
+        uint8_t encryptedCounter[kCCBlockSizeAES128];
+        size_t encryptedCounterLength = 0;
+        
+        CCCryptorStatus counterStatus = CCCrypt(
+            kCCEncrypt,
+            kCCAlgorithmAES,
+            0, // No padding for block mode
+            [self.dekKey bytes],
+            self.dekKey.length,
+            nil,
+            [currentIV bytes],
+            kCCBlockSizeAES128,
+            encryptedCounter,
+            kCCBlockSizeAES128,
+            &encryptedCounterLength
+        );
+        
+        if (counterStatus != kCCSuccess) {
+            NSLog(@"[RNSoundPlayer] Counter encryption failed with status: %d", counterStatus);
+            return nil;
+        }
+        
+        // Copy encrypted counter to keystream
+        NSUInteger bytesToCopy = MIN(kCCBlockSizeAES128, encryptedData.length - offset);
+        [keystream replaceBytesInRange:NSMakeRange(offset, bytesToCopy) withBytes:encryptedCounter length:bytesToCopy];
+        
+        // Increment counter for next block
+        uint8_t *ivBytes = (uint8_t *)[currentIV mutableBytes];
+        // Increment the counter part (last 8 bytes) in big-endian
+        for (int i = 15; i >= 8; i--) {
+            if (++ivBytes[i] != 0) break;
+        }
+    }
+    
+    // XOR encrypted data with keystream to get decrypted data
+    const uint8_t *encryptedBytes = (const uint8_t *)[encryptedData bytes];
+    const uint8_t *keystreamBytes = (const uint8_t *)[keystream bytes];
+    uint8_t *decryptedBytes = (uint8_t *)[decryptedData mutableBytes];
+    
+    for (NSUInteger i = 0; i < encryptedData.length; i++) {
+        decryptedBytes[i] = encryptedBytes[i] ^ keystreamBytes[i];
+    }
+    
+    [decryptedData setLength:encryptedData.length];
+    
+    NSLog(@"[RNSoundPlayer] Successfully decrypted %lu bytes at position %lld", (unsigned long)encryptedData.length, position);
+    
+    return [decryptedData copy];
 }
 
 @end
